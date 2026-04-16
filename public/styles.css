@@ -1,0 +1,531 @@
+* {
+  box-sizing: border-box;
+  font-family: "Segoe UI", "Noto Sans KR", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f4f7fb;
+  color: #222;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #1f2a44;
+  color: #fff;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar h1 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.sidebar button {
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #2a385b;
+  color: #fff;
+  cursor: pointer;
+}
+
+.sidebar button.active {
+  background: #2f80ed;
+}
+
+.main {
+  padding: 24px;
+  overflow-x: hidden;
+}
+
+.view {
+  display: block;
+}
+
+.hidden {
+  display: none;
+}
+
+.card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 2px 8px rgba(16, 24, 40, 0.08);
+  margin-bottom: 16px;
+}
+
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+form {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(100px, 1fr));
+  gap: 8px;
+  align-items: end;
+}
+
+label {
+  font-size: 12px;
+  color: #555;
+}
+
+input, select, button {
+  width: 100%;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid #d2d7e0;
+}
+
+button.primary {
+  background: #2f80ed;
+  border-color: #2f80ed;
+  color: #fff;
+  cursor: pointer;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  border-bottom: 1px solid #e6eaf2;
+  padding: 8px;
+  text-align: left;
+  font-size: 14px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 240px;
+  gap: 12px;
+}
+
+.history-row {
+  grid-template-columns: 240px 160px 100px;
+}
+
+.history-q {
+  width: 100%;
+}
+
+.stock-filter-row {
+  grid-template-columns: 1fr 90px 180px 220px 160px;
+}
+
+.product-top {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 12px;
+}
+
+.compact-upload {
+  border: 1px solid #e6eaf2;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.product-top.compact-top {
+  grid-template-columns: minmax(200px, 260px) minmax(240px, 320px) minmax(200px, 260px);
+  justify-content: start;
+  align-items: start;
+  gap: 10px;
+}
+
+.product-top.compact-top .compact-upload {
+  padding: 8px;
+}
+
+.product-top.compact-top h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.product-top.compact-top .muted {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+
+.product-top.compact-top .dropzone {
+  margin-top: 6px;
+  padding: 8px;
+}
+
+.product-top.compact-top button {
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.compact-upload h4 {
+  margin: 0 0 8px;
+}
+
+.products-grid {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 16px;
+}
+
+.products-left {
+  min-width: 0;
+}
+
+.table-scroll-x {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.table-scroll-proxy-wrap {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin-bottom: 8px;
+}
+
+.table-scroll-proxy-inner {
+  height: 1px;
+}
+
+#products-table {
+  min-width: 2200px;
+}
+
+.products-right {
+  min-width: 0;
+}
+
+.product-search-row {
+  grid-template-columns: 1fr 110px;
+}
+
+.compact-filter-row {
+  grid-template-columns: 1fr 40px;
+  margin-bottom: 8px;
+}
+
+.tag {
+  display: inline-block;
+  margin: 2px 6px 2px 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #e7f0ff;
+  color: #1f4ea3;
+}
+
+.tag-orange {
+  background: #fff1e8;
+  color: #ad4e00;
+  border: 1px solid #ffd8bf;
+}
+
+.tag-removable {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip-remove {
+  border: 0;
+  background: transparent;
+  color: #8c8c8c;
+  padding: 0;
+  width: auto;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.dropzone {
+  margin-top: 8px;
+  border: 1px dashed #9db4d8;
+  border-radius: 8px;
+  background: #f9fbff;
+  color: #3b4f72;
+  padding: 14px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.dropzone.drop-over {
+  background: #e9f2ff;
+  border-color: #2f80ed;
+}
+
+.hidden-file {
+  display: none;
+}
+
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.badge.green { background: #1f9d55; }
+.badge.red { background: #cf1322; }
+.badge.blue { background: #1d4ed8; }
+.badge.gray { background: #6b7280; }
+
+.tagline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.tag-wrap {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.del-small {
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+.compact-primary {
+  width: auto !important;
+  display: inline-block;
+  padding: 6px 10px !important;
+  font-size: 13px;
+}
+
+.del-small {
+  width: auto !important;
+  display: inline-block;
+}
+
+.cancel-btn {
+  border: 1px solid #cf1322;
+  background: #fff5f5;
+  color: #cf1322;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.low-stock-cell {
+  color: #cf1322;
+  font-weight: 700;
+}
+
+.low-status {
+  font-weight: 800;
+}
+
+.draggable-th {
+  cursor: grab;
+}
+
+.excel-th {
+  white-space: nowrap;
+}
+
+.excel-th-label {
+  margin-right: 6px;
+}
+
+.excel-th-trigger {
+  width: auto;
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 11px;
+  border: 1px solid #d6dbe6;
+  border-radius: 4px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+}
+
+.excel-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 180px;
+  max-width: 260px;
+  max-height: 300px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #d6dbe6;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
+  padding: 8px;
+}
+
+.excel-menu-btn {
+  width: 100%;
+  text-align: left;
+  border: 1px solid #e5e7eb;
+  background: #f8fafc;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.excel-menu-values {
+  border-top: 1px solid #eef1f6;
+  padding-top: 6px;
+  margin-top: 4px;
+}
+
+.excel-menu-item-all {
+  font-weight: 600;
+}
+
+.excel-menu-divider {
+  border-top: 1px solid #eef1f6;
+  margin: 4px 0 6px;
+}
+
+.excel-menu-item {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-start;
+  text-align: left;
+  font-size: 12px;
+  padding: 4px 0;
+  width: 100%;
+}
+
+.excel-menu-item input[type="checkbox"] {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.excel-menu-item span {
+  text-align: left;
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.movement-upload-card {
+  padding: 12px;
+}
+
+.movement-upload-card .dropzone {
+  padding: 10px;
+}
+
+.movement-upload-card .row {
+  grid-template-columns: 1fr 160px;
+}
+
+.movement-upload-card h3 {
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-overlay.hidden {
+  display: none;
+}
+
+.modal {
+  width: min(980px, calc(100vw - 24px));
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  padding: 16px;
+}
+
+#product-modal-overlay .modal {
+  width: min(900px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
+#product-popup-form {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  align-items: end;
+}
+
+#product-popup-form > div {
+  min-width: 0;
+}
+
+#product-popup-form .multi-select-field {
+  grid-column: span 2;
+}
+
+#product-popup-form .multi-select-row {
+  grid-template-columns: 1fr 90px;
+}
+
+#preview-deliveryVendors,
+#preview-orderManagers,
+#preview-categories,
+#product-popup-form > div:last-child {
+  grid-column: 1 / -1;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.muted {
+  color: #666;
+  font-size: 13px;
+}
+
+@media (max-width: 900px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  form {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+  .grid3,
+  .row,
+  .product-top,
+  .products-grid {
+    grid-template-columns: 1fr;
+  }
+}
