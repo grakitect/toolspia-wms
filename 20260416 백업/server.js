@@ -71,7 +71,6 @@ function normalizeDb(db) {
     p.usedWarehouses = toTagList(p.usedWarehouses).filter((w) => db.warehouses.includes(w));
     if (!p.ecountCode) p.ecountCode = String(p.code || "");
     if (!p.ecountName) p.ecountName = String(p.name || "");
-    p.middleBarcode = String(p.middleBarcode || "");
     p.status = firstToken(p.status, "판매중");
     p.supplyType = firstToken(p.supplyType, "");
     p.orderDept = firstToken(p.orderDept, "");
@@ -181,7 +180,6 @@ function upsertProduct(db, product) {
     ecountCode,
     ecountName: String(product.ecountName || name),
     barcode: String(product.barcode || ""),
-    middleBarcode: String(product.middleBarcode || ""),
     logisticsBarcode: String(product.logisticsBarcode || ""),
     status: firstToken(product.status, "판매중"),
     deliveryVendors,
