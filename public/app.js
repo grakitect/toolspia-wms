@@ -1,4 +1,4 @@
-const views = ["dashboard", "master", "products", "stock", "inbound", "outbound", "adjust", "history", "alert"];
+const views = ["dashboard", "master", "products", "stock", "inbound", "inbound-plan", "outbound", "adjust", "history", "alert"];
 const LAST_VIEW_KEY = "wms:lastView";
 const PRODUCT_HIDDEN_COLS_KEY = "wms:productHiddenCols";
 const TABLE_FILTER_MEMORY = {};
@@ -27,6 +27,14 @@ function qs(sel) {
 
 function esc(v) {
   return String(v ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
+function formatYmd(v) {
+  const raw = String(v || "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length !== 8) return raw;
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
 }
 
 function toTagList(v) {
@@ -1832,6 +1840,118 @@ function renderInbound() {
   renderRecentMovements("IN");
 }
 
+async function renderInboundPlan() {
+  const wrap = qs("#view-inbound-plan");
+  if (!wrap) return;
+  const today = new Date();
+  const from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 30).toISOString().slice(0, 10);
+  const to = today.toISOString().slice(0, 10);
+  wrap.innerHTML = `
+    <div class="card">
+      <h2>입고예정목록</h2>
+      <p class="muted">이카운트 발주 데이터를 읽기 전용으로 조회합니다.</p>
+      <div class="row" style="grid-template-columns: 180px 180px 100px 1fr;">
+        <input id="inbound-plan-from" type="date" value="${from}" />
+        <input id="inbound-plan-to" type="date" value="${to}" />
+        <button id="inbound-plan-search" class="primary" type="button">조회</button>
+        <div id="inbound-plan-status" class="muted" style="align-self:center;">대기 중</div>
+      </div>
+    </div>
+    <div class="card">
+      <div id="inbound-plan-table-wrap" class="muted">조회 버튼을 눌러주세요.</div>
+    </div>
+  `;
+
+  let inboundPlanQuerySeq = 0;
+  const draw = async () => {
+    const currentSeq = ++inboundPlanQuerySeq;
+    const fromEl = qs("#inbound-plan-from");
+    const toEl = qs("#inbound-plan-to");
+    const statusEl = qs("#inbound-plan-status");
+    const tableWrap = qs("#inbound-plan-table-wrap");
+    const searchBtn = qs("#inbound-plan-search");
+    const fromDate = fromEl?.value || "";
+    const toDate = toEl?.value || "";
+    try {
+      if (searchBtn) searchBtn.disabled = true;
+      if (statusEl) statusEl.textContent = "조회 중...";
+      const qsPart = `from=${encodeURIComponent(fromDate)}&to=${encodeURIComponent(toDate)}`;
+      const res = await api(`/api/inbound-plans?${qsPart}`);
+      // Ignore stale responses from earlier requests.
+      if (currentSeq !== inboundPlanQuerySeq) return;
+      const items = Array.isArray(res.items) ? res.items : [];
+      if (statusEl) {
+        const extra = res?.debug?.countRaw ? ` (원본 ${res.debug.countRaw})` : "";
+        statusEl.textContent = `총 ${items.length}건${extra}`;
+      }
+      if (!items.length) {
+        const code = res?.debug?.code ? ` / code: ${esc(res.debug.code)}` : "";
+        const msg = res?.debug?.message ? ` / msg: ${esc(res.debug.message)}` : "";
+        const keys = res?.debug?.topKeys?.length ? ` / keys: ${esc(res.debug.topKeys.join(", "))}` : "";
+        const dkeys = res?.debug?.dataKeys?.length ? ` / dataKeys: ${esc(res.debug.dataKeys.join(", "))}` : "";
+        const dtype = res?.debug?.dataType ? ` / dataType: ${esc(res.debug.dataType)}` : "";
+        const adj = res?.debug?.adjustedDateRange
+          ? ` / adjustedRange: ${esc(res.debug.adjustedDateRange.from)}~${esc(res.debug.adjustedDateRange.to)}`
+          : "";
+        const preview = res?.debug?.dataPreview ? `<br /><small class="muted">dataPreview: ${esc(res.debug.dataPreview)}</small>` : "";
+        const errPreview = res?.debug?.errorPreview ? `<br /><small class="muted">error: ${esc(res.debug.errorPreview)}</small>` : "";
+        const errsPreview = res?.debug?.errorsPreview ? `<br /><small class="muted">errors: ${esc(res.debug.errorsPreview)}</small>` : "";
+        tableWrap.innerHTML = `<span class="muted">조회 결과가 없습니다.${code}${msg}${keys}${dkeys}${dtype}${adj}</span>${preview}${errPreview}${errsPreview}`;
+        return;
+      }
+      const rows = items
+        .map(
+          (x, idx) => {
+            const qtyNum = Number(String(x.qty ?? "").replace(/,/g, ""));
+            const qtyText = Number.isFinite(qtyNum) ? qtyNum.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(x.qty || "");
+            return `<tr>
+            <td>${idx + 1}</td>
+            <td>${esc(x.poNo || "")}</td>
+            <td>${esc(formatYmd(x.poDate || ""))}</td>
+            <td>${esc(x.vendor || "")}</td>
+            <td>${esc(x.manager || "")}</td>
+            <td>${esc(x.itemName || "")}</td>
+            <td>${esc(qtyText)}</td>
+            <td>${esc(formatYmd(x.dueDate || ""))}</td>
+            <td>${esc(x.whName || "")}</td>
+            <td>${esc(x.status || "")}</td>
+          </tr>`;
+          }
+        )
+        .join("");
+      tableWrap.innerHTML = `
+        <table id="inbound-plan-table">
+          <thead>
+            <tr>
+              <th>순번</th>
+              <th>발주번호</th>
+              <th>발주일자</th>
+              <th>거래처</th>
+              <th>담당자</th>
+              <th>품목명</th>
+              <th>발주수량</th>
+              <th>납기일(입고예정일)</th>
+              <th>창고</th>
+              <th>상태</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+      delete TABLE_FILTER_MEMORY["#inbound-plan-table"];
+      applyExcelLikeFilter("#inbound-plan-table");
+    } catch (err) {
+      if (currentSeq !== inboundPlanQuerySeq) return;
+      if (statusEl) statusEl.textContent = "조회 실패";
+      tableWrap.innerHTML = `<span class="muted">${esc(err.message || "조회 실패")}</span>`;
+    } finally {
+      if (currentSeq === inboundPlanQuerySeq && searchBtn) searchBtn.disabled = false;
+    }
+  };
+
+  qs("#inbound-plan-search").onclick = () => draw();
+}
+
 function renderOutbound() {
   qs("#view-outbound").innerHTML = movementFormHtml("OUT", "출고", "등록 버튼 클릭시에만 등록됩니다.", "outbound", "출고처");
   bindMovement("OUT");
@@ -2106,6 +2226,7 @@ async function init() {
       if (v === "products") renderProducts();
       if (v === "stock") renderStock();
       if (v === "inbound") renderInbound();
+      if (v === "inbound-plan") await renderInboundPlan();
       if (v === "outbound") renderOutbound();
       if (v === "adjust") renderAdjust();
       if (v === "history") await renderHistory();
@@ -2119,6 +2240,7 @@ async function init() {
   renderProducts();
   renderStock();
   renderInbound();
+  await renderInboundPlan();
   renderOutbound();
   renderAdjust();
   await renderHistory();

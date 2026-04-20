@@ -3,6 +3,31 @@ const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  const raw = fs.readFileSync(envPath, "utf-8");
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadEnvFile();
+
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 const PRODUCT_OPTION_KEYS = [
@@ -371,6 +396,397 @@ function computeStockAfterEachMovement(db) {
   return afterMap;
 }
 
+let ecountSessionCache = { value: "", expiresAt: 0 };
+let ecountZoneCache = { zone: "", domain: "", expiresAt: 0 };
+let ecountApiBaseCache = { value: "", expiresAt: 0 };
+
+function normalizeDateCompact(ymd) {
+  const raw = String(ymd || "").trim();
+  const onlyDigits = raw.replace(/[^\d]/g, "");
+  if (onlyDigits.length !== 8) return "";
+  return onlyDigits;
+}
+
+function compactToUtcDate(yyyymmdd) {
+  const s = normalizeDateCompact(yyyymmdd);
+  if (!s) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(4, 6));
+  const d = Number(s.slice(6, 8));
+  if (!y || !m || !d) return null;
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function utcDateToCompact(dt) {
+  const y = dt.getUTCFullYear();
+  const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(dt.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+
+function clampDateRangeToMax30Days(fromCompact, toCompact) {
+  let fromDate = compactToUtcDate(fromCompact);
+  let toDate = compactToUtcDate(toCompact);
+  if (!fromDate || !toDate) return { fromCompact, toCompact, adjusted: false };
+  // If user selects reversed dates, normalize order.
+  if (fromDate.getTime() > toDate.getTime()) {
+    const tmp = fromDate;
+    fromDate = toDate;
+    toDate = tmp;
+  }
+  const normalizedFrom = utcDateToCompact(fromDate);
+  const normalizedTo = utcDateToCompact(toDate);
+  const diffDays = Math.floor((toDate.getTime() - fromDate.getTime()) / 86400000) + 1; // inclusive
+  if (diffDays <= 30) return { fromCompact: normalizedFrom, toCompact: normalizedTo, adjusted: false };
+  const adjustedFrom = new Date(toDate.getTime() - 29 * 86400000); // inclusive 30 days
+  return { fromCompact: utcDateToCompact(adjustedFrom), toCompact: normalizedTo, adjusted: true };
+}
+
+function extractSessionId(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const direct =
+    payload.SESSION_ID ||
+    payload.session_id ||
+    payload.sessionId ||
+    (payload.Data && (payload.Data.SESSION_ID || payload.Data.session_id || payload.Data.sessionId));
+  if (direct) return String(direct);
+
+  // Fallback: recursive search for possible session fields.
+  const stack = [payload];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== "object") continue;
+    for (const [k, v] of Object.entries(cur)) {
+      if (v && typeof v === "object") stack.push(v);
+      if (/session[_-]?id/i.test(String(k)) && v) return String(v);
+    }
+  }
+  return "";
+}
+
+async function fetchEcountSession() {
+  const now = Date.now();
+  if (ecountSessionCache.value && ecountSessionCache.expiresAt > now + 10_000) {
+    return ecountSessionCache.value;
+  }
+
+  const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+  const userId = String(process.env.ECOUNT_USER_ID || "").trim();
+  const userPw = String(process.env.ECOUNT_USER_PW || "").trim();
+  const apiKey = String(process.env.ECOUNT_API_KEY || "").trim();
+  const lang = String(process.env.ECOUNT_LANG || "ko-KR").trim();
+  const zoneInfo = await fetchEcountZone(comCode);
+
+  if (!comCode || !userId || !userPw || !apiKey) {
+    throw new Error(
+      "ECOUNT_COM_CODE/ECOUNT_USER_ID/ECOUNT_USER_PW/ECOUNT_API_KEY 설정이 필요합니다."
+    );
+  }
+
+  const loginBodies = Array.from(
+    new Set([String(comCode || "").trim(), String(comCode || "").trim().padStart(6, "0")].filter(Boolean))
+  ).map((cc) => ({
+    COM_CODE: cc,
+    USER_ID: userId,
+    USER_PW: userPw,
+    API_CERT_KEY: apiKey,
+    LAN_TYPE: lang,
+    ZONE: String(zoneInfo?.zone || "").trim(),
+    DOMAIN: String(zoneInfo?.domain || "").trim()
+  }));
+  const loginCandidates = [];
+  const forcedLoginUrl = String(process.env.ECOUNT_LOGIN_URL || "").trim();
+  if (forcedLoginUrl) loginCandidates.push(forcedLoginUrl);
+  for (const origin of buildEcountApiOrigins(zoneInfo)) {
+    loginCandidates.push(`${origin}/OAPI/V2/OAPILogin`);
+  }
+
+  let sessionId = "";
+  let lastErr = "";
+  for (const loginUrl of Array.from(new Set(loginCandidates))) {
+    for (const loginBody of loginBodies) {
+      try {
+        const resp = await fetch(loginUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(loginBody)
+        });
+        const txt = await resp.text();
+        if (!resp.ok) {
+          lastErr = `${loginUrl} [COM_CODE=${loginBody.COM_CODE}] -> (${resp.status}) ${txt.slice(0, 300)}`;
+          continue;
+        }
+        let data = {};
+        try {
+          data = JSON.parse(txt || "{}");
+        } catch (_) {
+          data = {};
+        }
+        sessionId = extractSessionId(data);
+        if (!sessionId) {
+          lastErr = `${loginUrl} [COM_CODE=${loginBody.COM_CODE}] -> SESSION_ID not found: ${txt.slice(0, 300)}`;
+          continue;
+        }
+        // Keep the successful API origin for subsequent calls.
+        const origin = new URL(loginUrl).origin;
+        ecountApiBaseCache = { value: origin, expiresAt: now + 20 * 60 * 1000 };
+        break;
+      } catch (err) {
+        lastErr = `${loginUrl} [COM_CODE=${loginBody.COM_CODE}] -> network error: ${err?.message || String(err)}`;
+        continue;
+      }
+    }
+    if (sessionId) break;
+  }
+  if (!sessionId) {
+    throw new Error(`이카운트 로그인 실패: ${lastErr || "응답 확인 필요"}`);
+  }
+
+  // Default cache 20 minutes (session ttl unknown); refresh early.
+  ecountSessionCache = {
+    value: sessionId,
+    expiresAt: now + 20 * 60 * 1000
+  };
+  return sessionId;
+}
+
+function buildEcountApiOrigins(zoneInfo) {
+  const list = [];
+  const forcedBase = String(process.env.ECOUNT_API_BASE_URL || "").trim();
+  if (forcedBase) {
+    try {
+      list.push(new URL(forcedBase).origin);
+    } catch (_) {
+      list.push(`https://${forcedBase.replace(/^https?:\/\//, "").replace(/\/+$/, "")}`);
+    }
+  }
+  const domain = String(zoneInfo?.domain || "").trim();
+  if (domain) {
+    const cleaned = domain.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    list.push(`https://${cleaned}`);
+  }
+  const zone = String(zoneInfo?.zone || "").trim();
+  if (zone) {
+    list.push(`https://oapi${zone}.ecount.com`);
+    list.push(`https://sboapi${zone}.ecount.com`);
+  }
+  return Array.from(new Set(list));
+}
+
+async function fetchEcountApiBase(comCode) {
+  const now = Date.now();
+  if (ecountApiBaseCache.value && ecountApiBaseCache.expiresAt > now + 10_000) {
+    return ecountApiBaseCache.value;
+  }
+  const zoneInfo = await fetchEcountZone(comCode);
+  const origins = buildEcountApiOrigins(zoneInfo);
+  if (!origins.length) throw new Error("이카운트 API 베이스 URL을 구성하지 못했습니다.");
+  ecountApiBaseCache = { value: origins[0], expiresAt: now + 20 * 60 * 1000 };
+  return ecountApiBaseCache.value;
+}
+
+async function fetchEcountZone(comCode) {
+  const forced = String(process.env.ECOUNT_ZONE || "").trim();
+  const forcedDomain = String(process.env.ECOUNT_DOMAIN || "").trim();
+  if (forced) return { zone: forced, domain: forcedDomain };
+
+  const now = Date.now();
+  if (ecountZoneCache.zone && ecountZoneCache.expiresAt > now + 60_000) {
+    return { zone: ecountZoneCache.zone, domain: ecountZoneCache.domain };
+  }
+  if (!comCode) throw new Error("ECOUNT_COM_CODE가 필요합니다.");
+
+  const zoneUrl = "https://oapi.ecount.com/OAPI/V2/Zone";
+  const comCandidates = Array.from(
+    new Set([String(comCode || "").trim(), String(comCode || "").trim().padStart(6, "0")].filter(Boolean))
+  );
+
+  let zone = "";
+  let domain = "";
+  let lastErrText = "";
+  for (const candidate of comCandidates) {
+    try {
+      const resp = await fetch(zoneUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ COM_CODE: candidate })
+      });
+      const bodyText = await resp.text();
+      if (!resp.ok) {
+        lastErrText = `COM_CODE=${candidate} -> (${resp.status}) ${bodyText.slice(0, 300)}`;
+        continue;
+      }
+      let data = {};
+      try {
+        data = JSON.parse(bodyText || "{}");
+      } catch (_) {
+        data = {};
+      }
+      zone = String(
+        pickFirst(data, ["ZONE"]) || pickFirst(data?.Data, ["ZONE"]) || pickFirst(data?.Result, ["ZONE"]) || ""
+      ).trim();
+      domain = String(
+        pickFirst(data, ["DOMAIN"]) || pickFirst(data?.Data, ["DOMAIN"]) || pickFirst(data?.Result, ["DOMAIN"]) || ""
+      ).trim();
+      if (zone) break;
+      lastErrText = `COM_CODE=${candidate} -> ZONE not found: ${bodyText.slice(0, 300)}`;
+    } catch (err) {
+      lastErrText = `COM_CODE=${candidate} -> network error: ${err?.message || String(err)}`;
+      continue;
+    }
+  }
+
+  if (!zone) {
+    throw new Error(
+      `Zone API 조회 실패. 회사코드(원본:${comCode}, 6자리:${String(comCode || "").trim().padStart(6, "0")})를 확인해주세요. 응답: ${String(
+        lastErrText || ""
+      ).slice(0, 300)}`
+    );
+  }
+
+  // Cache for one day; Zone rarely changes.
+  ecountZoneCache = { zone, domain, expiresAt: now + 24 * 60 * 60 * 1000 };
+  return { zone, domain };
+}
+
+function pickFirst(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] !== undefined && obj[k] !== null) return obj[k];
+  }
+  return "";
+}
+
+function pickFirstNonEmpty(obj, keys) {
+  for (const k of keys) {
+    const v = obj && obj[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+function pickFirstByKeyPattern(obj, patternFn) {
+  if (!obj || typeof obj !== "object") return "";
+  for (const k of Object.keys(obj)) {
+    if (!patternFn(k)) continue;
+    const v = obj[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+function pickPurchaseRequestNo(obj) {
+  const ordNo = String(pickFirstNonEmpty(obj, ["ORD_NO"]) || "").trim();
+  if (ordNo) return ordNo;
+
+  const ioNo = String(pickFirstNonEmpty(obj, ["IO_NO"]) || "").trim();
+  if (ioNo) return ioNo;
+
+  // Keep purchase-request style keys as a conservative fallback only.
+  return String(
+    pickFirstNonEmpty(obj, [
+      "PR_NO",
+      "REQ_NO",
+      "PUR_REQ_NO",
+      "REQUEST_NO",
+      "PURCHASE_REQ_NO",
+      "REQNUM",
+      "REQ_NUM",
+      "REQNO",
+      "PRNUM",
+      "PR_NUM",
+      "PURCHASE_REQUEST_NO",
+      "구매요청번호"
+    ]) || ""
+  ).trim();
+}
+
+function formatOrderNoByDateAndSeq(orderNo, orderDate, fallbackDateCompact = "") {
+  const no = String(orderNo || "").trim();
+  const dt = String(orderDate || "").trim();
+  if (!no) return no;
+
+  // Already complete format like 26/04/20-1
+  if (/^\d{2}\/\d{2}\/\d{2}-\d+$/.test(no)) return no;
+
+  // If numeric-like suffix is present (e.g. "1", "1.0000000000"), rebuild with order date.
+  const seqMatch = no.match(/(\d+)(?:\.0+)?$/);
+  if (!seqMatch) return no;
+  const seq = String(seqMatch[1] || "").trim();
+  if (!seq) return no;
+  const compact = normalizeDateCompact(dt) || String(fallbackDateCompact || "").trim();
+  if (!compact || compact.length !== 8) return no;
+  const yy = compact.slice(2, 4);
+  const mm = compact.slice(4, 6);
+  const dd = compact.slice(6, 8);
+  return `${yy}/${mm}/${dd}-${seq}`;
+}
+
+function normalizeInboundPlanRows(rawRows, fallbackDateCompact = "") {
+  const rows = Array.isArray(rawRows) ? rawRows : [];
+  return rows
+    .map((x) => {
+      const poNo = String(pickPurchaseRequestNo(x));
+      const poDate = String(
+        pickFirstNonEmpty(x, ["ORD_DATE", "PO_DATE", "PODATE", "ORDER_DATE", "DATE", "WRITE_DATE", "IO_DATE"])
+      );
+      // 거래처는 CUST_DES(거래처명)를 최우선으로 사용.
+      const vendor = String(
+        pickFirstNonEmpty(x, ["CUST_DES", "CUST_NM", "VENDOR_NM", "VENDOR_NAME", "CLIENT_NAME", "CUST"])
+      );
+      const manager = String(pickFirstNonEmpty(x, ["CUST_NAME", "EMP_CD", "WRITER_ID", "LOGID", "MANAGER", "MANAGER_NM"]));
+      const itemCode = String(
+        pickFirstNonEmpty(x, ["PROD_CD", "ITEM_CD", "ITEM_CODE", "GOODS_CD", "PRODUCT_CODE", "ITEM_NO", "품목코드"])
+      );
+      const itemName = String(
+        pickFirstNonEmpty(x, [
+          "PROD_DES",
+          "ITEM_NM",
+          "ITEM_NAME",
+          "GOODS_NM",
+          "PRODUCT_NAME",
+          "ITEM_DES",
+          "품목명",
+          "DES",
+          "REMARK"
+        ])
+      );
+      const qty = pickFirstNonEmpty(x, ["QTY", "ORDER_QTY", "PUR_QTY", "PO_QTY", "STOCK_QTY", "AMT_QTY"]);
+      const dueDate = String(pickFirstNonEmpty(x, ["TIME_DATE"]));
+      const whName = String(pickFirstNonEmpty(x, ["WH_NM", "WAREHOUSE_NM", "WH_NAME", "WH_DES", "WAREHOUSE_NAME"]));
+      const status = String(pickFirstNonEmpty(x, ["STATUS", "STAT_NM", "PROC_STATUS", "STATE", "PROGRESS"]));
+      const displayPoNo = formatOrderNoByDateAndSeq(poNo, poDate, fallbackDateCompact);
+      return { poNo: displayPoNo, poDate, vendor, manager, itemCode, itemName, qty, dueDate, whName, status };
+    });
+}
+
+function extractArrayFromUnknown(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+
+  const directCandidates = [
+    payload.Datas,
+    payload.Data,
+    payload.List,
+    payload.Result,
+    payload.items,
+    payload.Rows,
+    payload.records
+  ];
+  for (const c of directCandidates) {
+    if (Array.isArray(c)) return c;
+  }
+  for (const c of directCandidates) {
+    if (c && typeof c === "object") {
+      const nested = extractArrayFromUnknown(c);
+      if (nested.length) return nested;
+      // Some APIs return map-like objects instead of arrays.
+      const vals = Object.values(c);
+      if (vals.length && vals.every((v) => v && typeof v === "object")) return vals;
+    }
+  }
+  return [];
+}
+
 async function handleApi(req, res, urlObj) {
   const pathname = urlObj.pathname;
   const db = readDb();
@@ -657,6 +1073,121 @@ async function handleApi(req, res, urlObj) {
         };
       });
     return sendJson(res, 200, { items });
+  }
+
+  if (req.method === "GET" && pathname === "/api/inbound-plans") {
+    try {
+      const from = String(urlObj.searchParams.get("from") || "").trim();
+      const to = String(urlObj.searchParams.get("to") || "").trim();
+
+      // 1) explicit mock mode for UI/testing without ECOUNT credentials
+      if (String(process.env.ECOUNT_MOCK_MODE || "").trim() === "1") {
+        const items = [
+          {
+            poNo: "PO-2026-0001",
+            poDate: from || "2026-04-01",
+            vendor: "샘플거래처A",
+            itemCode: "EC-1001",
+            itemName: "샘플상품",
+            qty: 120,
+            dueDate: to || "2026-04-30",
+            whName: "툴스피아",
+            status: "발주완료"
+          }
+        ];
+        return sendJson(res, 200, { items, source: "mock" });
+      }
+
+      // 2) Real ECOUNT mode
+      const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+
+      const fromCompact = normalizeDateCompact(from);
+      const toCompact = normalizeDateCompact(to);
+      if (!fromCompact || !toCompact) {
+        throw new Error("조회 기간 형식이 올바르지 않습니다. (YYYY-MM-DD)");
+      }
+      const range = clampDateRangeToMax30Days(fromCompact, toCompact);
+
+      const sessionId = await fetchEcountSession();
+      const apiBase = await fetchEcountApiBase(comCode);
+      const url = `${apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=${encodeURIComponent(sessionId)}`;
+      const payload = {
+        PROD_CD: "",
+        CUST_CD: "",
+        ListParam: {
+          BASE_DATE_FROM: range.fromCompact,
+          BASE_DATE_TO: range.toCompact,
+          PAGE_CURRENT: 1,
+          PAGE_SIZE: 100
+        }
+      };
+
+      const callEcountList = async () =>
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+      let r = await callEcountList();
+
+      if (!r.ok) {
+        const txt = await r.text();
+        // session can expire/revoke; clear cache for retry on next call
+        ecountSessionCache = { value: "", expiresAt: 0 };
+        throw new Error(`발주서 조회 실패(${r.status}): ${txt.slice(0, 300)}`);
+      }
+      let data = await r.json();
+      const bodyMsg = String(data?.Data?.Message || data?.Message || data?.Error?.Message || "");
+      const needsRetry =
+        bodyMsg.includes("세션") ||
+        bodyMsg.toLowerCase().includes("session") ||
+        String(data?.Status || "") === "401";
+      if (needsRetry) {
+        ecountSessionCache = { value: "", expiresAt: 0 };
+        const freshSession = await fetchEcountSession();
+        const retryUrl = `${apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=${encodeURIComponent(freshSession)}`;
+        r = await fetch(retryUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`발주서 재조회 실패(${r.status}): ${txt.slice(0, 300)}`);
+        }
+        data = await r.json();
+      }
+      const rawRows = extractArrayFromUnknown(data);
+      const items = normalizeInboundPlanRows(rawRows, range.toCompact);
+      const topKeys = data && typeof data === "object" ? Object.keys(data).slice(0, 20) : [];
+      const dataKeys =
+        data && data.Data && typeof data.Data === "object" ? Object.keys(data.Data).slice(0, 20) : [];
+      const dataType = data?.Data === null ? "null" : Array.isArray(data?.Data) ? "array" : typeof data?.Data;
+      const dataPreview =
+        data?.Data && typeof data.Data === "object" ? JSON.stringify(data.Data).slice(0, 500) : String(data?.Data || "");
+      const errorPreview = data?.Error ? JSON.stringify(data.Error).slice(0, 500) : "";
+      const errorsPreview = data?.Errors ? JSON.stringify(data.Errors).slice(0, 500) : "";
+      return sendJson(res, 200, {
+        items,
+        source: "ecount-live",
+        debug: {
+          countRaw: Array.isArray(rawRows) ? rawRows.length : 0,
+          status: data?.Status,
+          code: data?.Data?.Code || data?.Code || "",
+          message: data?.Data?.Message || data?.Message || "",
+          topKeys,
+          dataKeys,
+          dataType,
+          dataPreview,
+          errorPreview,
+          errorsPreview,
+          adjustedDateRange: range.adjusted ? { from: range.fromCompact, to: range.toCompact } : null
+        }
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
   }
 
   if (req.method === "GET" && pathname === "/api/dashboard") {

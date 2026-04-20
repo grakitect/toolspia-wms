@@ -43,6 +43,13 @@ body {
   background: #2f80ed;
 }
 
+.sidebar .sidebar-sub {
+  margin-left: 16px;
+  background: #243251;
+  font-size: 13px;
+  padding: 8px 10px;
+}
+
 .main {
   padding: 24px;
   overflow-x: hidden;
