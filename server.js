@@ -28,6 +28,8 @@ function loadEnvFile() {
 
 loadEnvFile();
 
+const XLSX = require("xlsx");
+
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 const PRODUCT_OPTION_KEYS = [
@@ -57,7 +59,8 @@ function ensureDb() {
         purchase: []
       },
       managers: ["admin"],
-      seq: 1
+      seq: 1,
+      inboundPlanUpload: { lines: [], sourceFileName: "", uploadedAt: "" }
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2), "utf-8");
   }
@@ -117,6 +120,10 @@ function normalizeDb(db) {
   for (const m of db.movements) {
     if (!m.warehouse) m.warehouse = "툴스피아";
   }
+  if (!db.inboundPlanUpload || typeof db.inboundPlanUpload !== "object") {
+    db.inboundPlanUpload = { lines: [], sourceFileName: "", uploadedAt: "" };
+  }
+  if (!Array.isArray(db.inboundPlanUpload.lines)) db.inboundPlanUpload.lines = [];
 }
 
 function sendJson(res, code, payload) {
@@ -721,6 +728,32 @@ function formatOrderNoByDateAndSeq(orderNo, orderDate, fallbackDateCompact = "")
   return `${yy}/${mm}/${dd}-${seq}`;
 }
 
+function buildInboundPlanDetail(raw) {
+  const x = raw && typeof raw === "object" ? raw : {};
+  const entries = [
+    ["전표번호", pickFirstNonEmpty(x, ["ORD_NO", "IO_NO"])],
+    ["발주일자", pickFirstNonEmpty(x, ["ORD_DATE", "IO_DATE"])],
+    ["납기일자", pickFirstNonEmpty(x, ["TIME_DATE"])],
+    ["거래처코드", pickFirstNonEmpty(x, ["CUST"])],
+    ["거래처명", pickFirstNonEmpty(x, ["CUST_DES"])],
+    ["담당자", pickFirstNonEmpty(x, ["CUST_NAME", "EMP_CD", "WRITER_ID", "LOGID"])],
+    ["품목명", pickFirstNonEmpty(x, ["PROD_DES", "ITEM_DES", "ITEM_NAME"])],
+    ["수량", pickFirstNonEmpty(x, ["QTY", "ORDER_QTY", "PUR_QTY"])],
+    ["창고코드", pickFirstNonEmpty(x, ["WH_CD"])],
+    ["창고명", pickFirstNonEmpty(x, ["WH_DES"])],
+    ["비고", pickFirstNonEmpty(x, ["REF_DES"])],
+    ["상태코드", pickFirstNonEmpty(x, ["P_FLAG"])],
+    ["전송상태", pickFirstNonEmpty(x, ["SEND_FLAG"])]
+  ];
+  for (let i = 1; i <= 6; i += 1) {
+    entries.push([`보조항목${i}`, pickFirstNonEmpty(x, [`P_DES${i}`])]);
+  }
+  return entries
+    .map(([label, value]) => ({ label, value: String(value || "").trim() }))
+    .filter((row) => row.value);
+}
+
+/** 발주서조회API Result 한 행 → WMS 입고예정목록 행 (이카운트 필드명은 주석/문서와 동일 계열). */
 function normalizeInboundPlanRows(rawRows, fallbackDateCompact = "") {
   const rows = Array.isArray(rawRows) ? rawRows : [];
   return rows
@@ -750,13 +783,311 @@ function normalizeInboundPlanRows(rawRows, fallbackDateCompact = "") {
           "REMARK"
         ])
       );
+      const spec = String(pickFirstNonEmpty(x, ["SPEC", "SIZE_DES", "ITEM_SPEC", "규격"]));
+      const barcode = String(pickFirstNonEmpty(x, ["BAR_CODE", "BARCODE", "PROD_BARCODE", "ITEM_BARCODE"]));
+      const boxQty = pickFirstNonEmpty(x, ["UQTY", "BOX_QTY", "QTY_BOX"]);
       const qty = pickFirstNonEmpty(x, ["QTY", "ORDER_QTY", "PUR_QTY", "PO_QTY", "STOCK_QTY", "AMT_QTY"]);
       const dueDate = String(pickFirstNonEmpty(x, ["TIME_DATE"]));
       const whName = String(pickFirstNonEmpty(x, ["WH_NM", "WAREHOUSE_NM", "WH_NAME", "WH_DES", "WAREHOUSE_NAME"]));
       const status = String(pickFirstNonEmpty(x, ["STATUS", "STAT_NM", "PROC_STATUS", "STATE", "PROGRESS"]));
+      const remark = String(pickFirstNonEmpty(x, ["REF_DES", "REMARK", "NOTE", "DESC"]));
+      const note = String(pickFirstNonEmpty(x, ["MEMO", "BIGO", "NOTE2"]));
+      const currency = String(pickFirstNonEmpty(x, ["CODE_DES", "EXCHANGE_TYPE", "FOREIGN_FLAG"]));
       const displayPoNo = formatOrderNoByDateAndSeq(poNo, poDate, fallbackDateCompact);
-      return { poNo: displayPoNo, poDate, vendor, manager, itemCode, itemName, qty, dueDate, whName, status };
+      const detail = buildInboundPlanDetail(x);
+      return {
+        poNo: displayPoNo,
+        poDate,
+        vendor,
+        manager,
+        itemCode,
+        itemName,
+        spec,
+        barcode,
+        boxQty,
+        qty,
+        dueDate,
+        whName,
+        status,
+        remark,
+        note,
+        currency,
+        detail
+      };
     });
+}
+
+function normalizeSlipNoText(v) {
+  return String(v || "").trim().replace(/\s+/g, "");
+}
+
+/** 이카운트 발주서현황 엑셀의 「일자-No.」에서 날짜 부분 → YYYY-MM-DD */
+function slipDateFromEcountSlipCell(slipRaw) {
+  const s = String(slipRaw || "").trim();
+  const m = s.match(/^(\d{4})\/(\d{2})\/(\d{2})/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+function splitItemNameSpecFromEcountCell(raw) {
+  const s = String(raw || "").trim();
+  const m = s.match(/^(.+?)\s*\[([^\]]*)\]\s*$/);
+  if (m) return { itemName: m[1].trim(), spec: m[2].trim() };
+  return { itemName: s, spec: "" };
+}
+
+function numOrEmpty(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  const n = Number(String(v).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : "";
+}
+
+/**
+ * 이카운트 「발주서현황」 내보내기 시트(1행 제목·2행 헤더) → 라인 객체 배열
+ * @param {unknown[][]} matrix sheet_to_json(..., { header:1 }) 결과
+ */
+function parseInboundPlanUploadMatrix(matrix) {
+  const rows = Array.isArray(matrix) ? matrix : [];
+  let headerRow = -1;
+  for (let i = 0; i < Math.min(rows.length, 80); i++) {
+    const r = rows[i] || [];
+    const c0 = String(r[0] ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const c1 = String(r[1] ?? "").trim();
+    const headLike =
+      (c0.includes("일자") && c1 === "품목코드") ||
+      c0 === "일자-No." ||
+      /^일자[-–]\s*No\.?$/i.test(c0);
+    if (headLike && (c1 === "품목코드" || c1.includes("품목코드"))) {
+      headerRow = i;
+      break;
+    }
+  }
+  if (headerRow < 0) {
+    throw new Error("발주서현황 양식을 찾지 못했습니다. 1행 제목·2행에 「일자-No.」「품목코드」 헤더가 있는지 확인하세요.");
+  }
+  const H = (rows[headerRow] || []).map((c) => String(c ?? "").trim());
+  const col = (...labels) => {
+    for (const lb of labels) {
+      const j = H.indexOf(lb);
+      if (j >= 0) return j;
+    }
+    return -1;
+  };
+  const iSlip = col("일자-No.");
+  const iCode = col("품목코드");
+  const iBc = col("바코드");
+  const iWh = col("창고명");
+  const iName = col("품목명[규격]");
+  const iQty = col("수량");
+  const iMgr = col("담당자");
+  const iVc = col("거래처코드");
+  const iVn = col("거래처");
+  const iDue = col("납기일자");
+  const iPrice = col("단가");
+  const iAmt = col("공급가액");
+  const iRef = col("적요");
+  const iNote = col("비고");
+  if (iSlip < 0 || iCode < 0) {
+    throw new Error("필수 열(일자-No., 품목코드)을 찾지 못했습니다.");
+  }
+  const lines = [];
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const slipRaw = String(row[iSlip] ?? "").trim();
+    const itemCode = String(row[iCode] ?? "").trim();
+    if (!slipRaw && !itemCode) continue;
+    if (!slipRaw || !itemCode) continue;
+    const { itemName, spec } = splitItemNameSpecFromEcountCell(iName >= 0 ? row[iName] : "");
+    const poDate = slipDateFromEcountSlipCell(slipRaw);
+    lines.push({
+      slipNo: slipRaw.replace(/\s+/g, " ").trim(),
+      poDate,
+      itemCode,
+      barcode: iBc >= 0 ? String(row[iBc] ?? "").trim() : "",
+      whName: iWh >= 0 ? String(row[iWh] ?? "").trim() : "",
+      itemName,
+      spec,
+      qty: numOrEmpty(iQty >= 0 ? row[iQty] : ""),
+      manager: iMgr >= 0 ? String(row[iMgr] ?? "").trim() : "",
+      vendorCode: iVc >= 0 ? String(row[iVc] ?? "").trim() : "",
+      vendor: iVn >= 0 ? String(row[iVn] ?? "").trim() : "",
+      dueDate: iDue >= 0 ? String(row[iDue] ?? "").trim().replace(/\s+$/, "") : "",
+      unitPrice: numOrEmpty(iPrice >= 0 ? row[iPrice] : ""),
+      supplyAmount: numOrEmpty(iAmt >= 0 ? row[iAmt] : ""),
+      remark: iRef >= 0 ? String(row[iRef] ?? "").trim() : "",
+      note: iNote >= 0 ? String(row[iNote] ?? "").trim() : ""
+    });
+  }
+  if (!lines.length) throw new Error("데이터 행이 없습니다. 헤더 아래에 품목 행이 있는지 확인하세요.");
+  return lines;
+}
+
+function aggregateInboundPlanUploadLines(lines) {
+  const arr = Array.isArray(lines) ? lines : [];
+  const by = new Map();
+  for (const row of arr) {
+    const k = normalizeSlipNoText(row.slipNo);
+    if (!k) continue;
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(row);
+  }
+  const items = [];
+  for (const [, group] of by) {
+    group.sort((a, b) => String(a.itemCode).localeCompare(String(b.itemCode)));
+    const first = group[0];
+    const totalQty = group.reduce((s, x) => s + (Number(x.qty) || 0), 0);
+    const names = group.map((x) => x.itemName).filter(Boolean);
+    const itemSummary = names.length <= 1 ? (names[0] || "") : `${names[0]} 외 ${names.length - 1}건`;
+    items.push({
+      poNo: first.slipNo,
+      poDate: first.poDate || slipDateFromEcountSlipCell(first.slipNo),
+      vendor: first.vendor || "",
+      manager: first.manager || "",
+      itemName: itemSummary,
+      qty: totalQty,
+      dueDate: first.dueDate || "",
+      whName: first.whName || "",
+      status: "업로드",
+      lineCount: group.length
+    });
+  }
+  items.sort((a, b) => String(a.poNo).localeCompare(String(b.poNo), "ko"));
+  return items;
+}
+
+function inboundPlanUploadLinesToDetailRows(lines, slipKeyNorm) {
+  const group = (Array.isArray(lines) ? lines : []).filter((x) => normalizeSlipNoText(x.slipNo) === slipKeyNorm);
+  return group.map((x) => ({
+    poNo: x.slipNo,
+    poDate: x.poDate,
+    vendor: x.vendor,
+    manager: x.manager,
+    itemCode: x.itemCode,
+    itemName: x.itemName,
+    spec: x.spec,
+    barcode: x.barcode,
+    boxQty: "",
+    qty: x.qty,
+    dueDate: x.dueDate,
+    whName: x.whName,
+    status: "",
+    remark: x.remark,
+    note: x.note,
+    currency: "",
+    unitPrice: x.unitPrice,
+    supplyAmount: x.supplyAmount,
+    vendorCode: x.vendorCode,
+    detail: []
+  }));
+}
+
+/** ECOUNT list row may embed line items under various keys; expand for detail view. */
+const NESTED_LINE_ARRAY_KEYS = [
+  "Details",
+  "Detail",
+  "DetailList",
+  "DETAIL",
+  "DETAILS",
+  "ItemList",
+  "Items",
+  "Lines",
+  "LineList",
+  "DTL",
+  "DTL_LIST",
+  "ORDER_DETAIL",
+  "ORDER_DETAILS",
+  "PurchasesOrderDetail",
+  "ResultDetail",
+  "Datas"
+];
+
+function rowLooksLikeOrderLine(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  if (
+    pickFirstNonEmpty(obj, ["PROD_CD", "ITEM_CD", "LINE_NO", "LINE_NUM", "SER_NO", "SEQ", "LINE_SEQ"])
+  ) {
+    return true;
+  }
+  const hasName = Boolean(pickFirstNonEmpty(obj, ["PROD_DES", "ITEM_DES", "ITEM_NAME"]));
+  const hasQty = Boolean(pickFirstNonEmpty(obj, ["QTY", "ORDER_QTY", "PUR_QTY", "PO_QTY"]));
+  const hasOrd = Boolean(pickFirstNonEmpty(obj, ["ORD_NO", "IO_NO"]));
+  return hasName && hasQty && !hasOrd;
+}
+
+function rowLooksLikeOrderHeader(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const hasOrd = Boolean(pickFirstNonEmpty(obj, ["ORD_NO", "IO_NO"]));
+  const hasLineHint = rowLooksLikeOrderLine(obj);
+  return hasOrd && !hasLineHint;
+}
+
+function extractNestedLineRowsFromOrderRow(orderRow, depth = 0) {
+  if (!orderRow || typeof orderRow !== "object" || depth > 8) return [];
+
+  for (const k of NESTED_LINE_ARRAY_KEYS) {
+    const v = orderRow[k];
+    if (Array.isArray(v) && v.length && v.every((x) => x && typeof x === "object")) {
+      const lineish = v.filter((x) => rowLooksLikeOrderLine(x));
+      if (lineish.length >= 1) return lineish;
+    }
+  }
+
+  for (const k of Object.keys(orderRow)) {
+    const v = orderRow[k];
+    if (!Array.isArray(v) || v.length < 1) continue;
+    if (!v.every((x) => x && typeof x === "object")) continue;
+    const lineish = v.filter((x) => rowLooksLikeOrderLine(x));
+    if (lineish.length >= 2 || (lineish.length === 1 && !rowLooksLikeOrderHeader(lineish[0]))) {
+      return lineish;
+    }
+  }
+
+  for (const k of Object.keys(orderRow)) {
+    const v = orderRow[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const found = extractNestedLineRowsFromOrderRow(v, depth + 1);
+      if (found.length) return found;
+    }
+  }
+
+  return [];
+}
+
+function mergeOrderHeaderWithLines(headerRaw, lineRows) {
+  const lines = Array.isArray(lineRows) ? lineRows : [];
+  return lines.map((line) => ({ ...headerRaw, ...line }));
+}
+
+/** For Network debug: show which keys exist on the slip header (arrays = possible line containers). */
+function buildHeaderDebugSummary(headerRaw, maxKeys = 45) {
+  if (!headerRaw || typeof headerRaw !== "object") return null;
+  const keys = Object.keys(headerRaw).slice(0, maxKeys);
+  const summary = {};
+  for (const k of keys) {
+    const v = headerRaw[k];
+    if (v === null || v === undefined) summary[k] = "null";
+    else if (Array.isArray(v)) summary[k] = `array[${v.length}]`;
+    else if (typeof v === "object") summary[k] = `object{${Object.keys(v).slice(0, 8).join(",")}}`;
+    else summary[k] = typeof v;
+  }
+  return summary;
+}
+
+function findMatchingRawOrderRow(rawRows, targetSlipNorm, seq, fallbackDateCompact) {
+  const rows = Array.isArray(rawRows) ? rawRows : [];
+  for (const r of rows) {
+    const poNoRaw = String(pickPurchaseRequestNo(r) || "").trim();
+    const poDate = String(
+      pickFirstNonEmpty(r, ["ORD_DATE", "PO_DATE", "PODATE", "ORDER_DATE", "DATE", "WRITE_DATE", "IO_DATE"])
+    );
+    const displayPo = formatOrderNoByDateAndSeq(poNoRaw, poDate, fallbackDateCompact);
+    const norm = normalizeSlipNoText(displayPo);
+    if (norm && norm === targetSlipNorm) return r;
+    if (seq && norm.endsWith(`-${seq}`)) return r;
+  }
+  return null;
 }
 
 function extractArrayFromUnknown(payload) {
@@ -785,6 +1116,149 @@ function extractArrayFromUnknown(payload) {
     }
   }
   return [];
+}
+
+/** 발주/구매전표 키로 상세·라인 조회 시도용 요청 바디 후보 (루트 vs ListParam). */
+function buildLineLookupBodies(basePayload, slipNo, ordNoRaw, ioNoRaw) {
+  const lp = basePayload.ListParam ? { ...basePayload.ListParam } : {};
+  const out = [];
+  const ord = String(ordNoRaw || "").trim();
+  const io = String(ioNoRaw || "").trim();
+  const slip = String(slipNo || "").trim();
+  const add = (body) => out.push(body);
+
+  if (ord) {
+    add({ ...basePayload, ORD_NO: ord });
+    add({ ...basePayload, ListParam: { ...lp, ORD_NO: ord } });
+  }
+  if (io) {
+    add({ ...basePayload, IO_NO: io });
+    add({ ...basePayload, ListParam: { ...lp, IO_NO: io } });
+  }
+  if (slip) {
+    if (!ord) add({ ...basePayload, ORD_NO: slip });
+    if (!ord) add({ ...basePayload, ListParam: { ...lp, ORD_NO: slip } });
+    add({ ...basePayload, ListParam: { ...lp, DOC_NO: slip } });
+    add({ ...basePayload, DOC_NO: slip });
+    add({ ...basePayload, SLIP_NO: slip });
+    add({ ...basePayload, ListParam: { ...lp, SLIP_NO: slip } });
+  }
+
+  const seen = new Set();
+  return out.filter((b) => {
+    const s = JSON.stringify(b);
+    if (seen.has(s)) return false;
+    seen.add(s);
+    return true;
+  });
+}
+
+function parseInboundLineApiPathSpecs(raw) {
+  return String(raw || "")
+    .split(/[,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((spec) => {
+      const t = spec.replace(/^\/+/, "");
+      if (!t.includes("/")) return `Purchases/${t}`;
+      return t;
+    });
+}
+
+/** ECOUNT 상세/라인 JSON → normalizeInboundPlanRows와 동일 규칙으로 병합. */
+function matchDetailRowsToInboundPlans(data, rangeCompact) {
+  const rowsCandidate = extractArrayFromUnknown(data);
+  if (!Array.isArray(rowsCandidate) || !rowsCandidate.length) return { matched: [], kind: "empty" };
+  if (rowsCandidate.length > 1 && rowsCandidate.every((row) => rowLooksLikeOrderLine(row))) {
+    return {
+      matched: normalizeInboundPlanRows(rowsCandidate, rangeCompact),
+      kind: "multi-line"
+    };
+  }
+  const nested = extractNestedLineRowsFromOrderRow(rowsCandidate[0]);
+  if (nested.length) {
+    const merged = mergeOrderHeaderWithLines(rowsCandidate[0], nested);
+    return {
+      matched: normalizeInboundPlanRows(merged, rangeCompact),
+      kind: "nested"
+    };
+  }
+  return {
+    matched: normalizeInboundPlanRows(rowsCandidate, rangeCompact),
+    kind: "flat"
+  };
+}
+
+function filterLikelyItemLines(matched) {
+  const rows = Array.isArray(matched) ? matched : [];
+  return rows.filter((x) => {
+    const hasCode = String(x.itemCode || "").trim() !== "";
+    const hasQty = String(x.qty || "").trim() !== "";
+    const isSummaryTitle = /외\s*\d+건/.test(String(x.itemName || ""));
+    return (hasCode || hasQty) && !isSummaryTitle;
+  });
+}
+
+/**
+ * GetPurchases 등 내장 후보 API 일괄 호출을 할지 여부.
+ * 기본은 호출하지 않음(대부분 존에서 404·412·긴 지연만 발생). 다시 켜려면 ECOUNT_SKIP_BUILTIN_LINE_APIS=0
+ */
+function shouldSkipBuiltinLineApis() {
+  const v = String(process.env.ECOUNT_SKIP_BUILTIN_LINE_APIS ?? "").trim().toLowerCase();
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  return true;
+}
+
+/** 디버그용: 같은 API 경로·HTTP상태(또는 no-item-lines)로 여러 바디를 시도한 로그를 한 줄로 합침. */
+function compressEndpointErrorsForDebug(lines, maxOut = 14) {
+  const arr = Array.isArray(lines) ? lines : [];
+  const groups = new Map();
+  for (const line of arr) {
+    let sig = line;
+    // Module/method paths contain slashes (e.g. Purchases/GetPurchases); use .+ not [^:]+
+    const mHttp = /^(.+):\((\d+)\)/.exec(line);
+    if (mHttp) sig = `${mHttp[1]}:${mHttp[2]}`;
+    else {
+      const idx = line.indexOf(":no-item-lines");
+      if (idx > 0) sig = `${line.slice(0, idx)}:no-item-lines`;
+    }
+    const cur = groups.get(sig);
+    if (cur) cur.count += 1;
+    else groups.set(sig, { count: 1, sample: line });
+  }
+  const out = [];
+  for (const { count, sample } of groups.values()) {
+    const s = String(sample);
+    const short = s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    out.push(count > 1 ? `${short} (같은 유형 ${count}회 시도)` : short);
+  }
+  return out.slice(0, maxOut);
+}
+
+async function postEcountOapiV2(apiBase, sessionId, v2Path, body) {
+  const path = String(v2Path || "").replace(/^\/+/, "");
+  const url = `${apiBase}/OAPI/V2/${path}?SESSION_ID=${encodeURIComponent(sessionId)}`;
+  const doOnce = async () => {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    let data = {};
+    try {
+      data = JSON.parse(text || "{}");
+    } catch (_) {
+      data = {};
+    }
+    return { ok: r.ok, status: r.status, data, text };
+  };
+  let result = await doOnce();
+  if (result.status === 412) {
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    result = await doOnce();
+  }
+  return result;
 }
 
 async function handleApi(req, res, urlObj) {
@@ -1075,6 +1549,89 @@ async function handleApi(req, res, urlObj) {
     return sendJson(res, 200, { items });
   }
 
+  /*
+   * 입고예정목록 2 — 이카운트 「발주서현황」 엑셀 업로드 → data/db.json inboundPlanUpload
+   */
+  if (req.method === "POST" && pathname === "/api/inbound-plan-upload") {
+    try {
+      const body = await parseBody(req);
+      const sourceFileName = String(body.sourceFileName || "").trim().slice(0, 240);
+      let lines = [];
+      if (Array.isArray(body.lines) && body.lines.length) {
+        lines = body.lines;
+      } else if (Array.isArray(body.matrix) && body.matrix.length) {
+        lines = parseInboundPlanUploadMatrix(body.matrix);
+      } else if (body.sheetBase64 && typeof body.sheetBase64 === "string") {
+        const buf = Buffer.from(String(body.sheetBase64).trim(), "base64");
+        const wb = XLSX.read(buf, { type: "buffer" });
+        const name = wb.SheetNames[0];
+        if (!name) throw new Error("시트가 없습니다.");
+        const ws = wb.Sheets[name];
+        const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        lines = parseInboundPlanUploadMatrix(matrix);
+      } else {
+        throw new Error("요청에 matrix(2차원 배열), lines, 또는 sheetBase64가 필요합니다.");
+      }
+      if (lines.length > 20000) throw new Error("행 수가 너무 많습니다(최대 20000).");
+      db.inboundPlanUpload.lines = lines;
+      db.inboundPlanUpload.sourceFileName = sourceFileName || "upload.xlsx";
+      db.inboundPlanUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      const items = aggregateInboundPlanUploadLines(lines);
+      return sendJson(res, 200, {
+        ok: true,
+        lineCount: lines.length,
+        slipCount: items.length,
+        items,
+        sourceFileName: db.inboundPlanUpload.sourceFileName,
+        uploadedAt: db.inboundPlanUpload.uploadedAt
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/inbound-plan-upload") {
+    const lines = db.inboundPlanUpload.lines || [];
+    const items = aggregateInboundPlanUploadLines(lines);
+    return sendJson(res, 200, {
+      items,
+      lineCount: lines.length,
+      sourceFileName: db.inboundPlanUpload.sourceFileName || "",
+      uploadedAt: db.inboundPlanUpload.uploadedAt || ""
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/api/inbound-plan-upload/detail") {
+    const slipNo = String(urlObj.searchParams.get("slipNo") || "").trim();
+    if (!slipNo) return sendJson(res, 400, { error: "slipNo가 필요합니다." });
+    const key = normalizeSlipNoText(slipNo);
+    const lines = db.inboundPlanUpload.lines || [];
+    const detailLines = inboundPlanUploadLinesToDetailRows(lines, key);
+    if (!detailLines.length) {
+      return sendJson(res, 200, { item: null, items: [], source: "upload" });
+    }
+    return sendJson(res, 200, {
+      item: detailLines[0],
+      items: detailLines,
+      source: "upload"
+    });
+  }
+
+  /*
+   * 입고예정목록 = 이카운트 발주서 조회(발주서조회API) 연동 요약
+   * - 목록: POST {apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=...
+   * - 요청(문서 기준): SESSION_ID, PROD_CD(선택), CUST_CD(선택), ListParam.BASE_DATE_FROM/TO(YYYYMMDD), PAGE_*
+   * - 응답: Data.Result[] 등 (extractArrayFromUnknown) → normalizeInboundPlanRows()에서 필드 매핑
+   * - 주요 Result 필드(문서/화면 기준): ORD_NO 발주번호, ORD_DATE 일자, CUST/CUST_DES 거래처,
+   *   CUST_NAME 담당자, WH_CD/WH_DES 창고, TIME_DATE 납기일, PROD_DES 품목요약(전표당 1줄일 때 제목성),
+   *   QTY 합계수량, TTL_CTT 제목, P_FLAG 상태 등
+   * - 프론트: public/app.js renderInboundPlan → GET /api/inbound-plans, 클릭 시 /api/inbound-plans/detail
+   * - 품목 라인별 상세: 목록에 라인이 없으면 구매/입고 계열 다른 OAPI 시도
+   *   · ECOUNT_INBOUND_LINE_API_PATHS=Purchases/GetX,Inventory/GetY (쉼표·세미콜론, 모듈/메서드 또는 메서드만)
+   *   · ECOUNT_INBOUND_DETAIL_API=API명 또는 Module/Method (기존 단일 상세 후보)
+   *   · ECOUNT_SKIP_BUILTIN_LINE_APIS — 기본: 내장 후보 호출 안 함. 예전처럼 여러 URL을 자동 시도하려면 =0 (false/no/off)
+   */
   if (req.method === "GET" && pathname === "/api/inbound-plans") {
     try {
       const from = String(urlObj.searchParams.get("from") || "").trim();
@@ -1183,6 +1740,287 @@ async function handleApi(req, res, urlObj) {
           errorPreview,
           errorsPreview,
           adjustedDateRange: range.adjusted ? { from: range.fromCompact, to: range.toCompact } : null
+        }
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/inbound-plans/detail") {
+    try {
+      const slipNo = String(urlObj.searchParams.get("slipNo") || "").trim();
+      const from = String(urlObj.searchParams.get("from") || "").trim();
+      const to = String(urlObj.searchParams.get("to") || "").trim();
+      if (!slipNo) throw new Error("전표번호(slipNo)가 필요합니다.");
+
+      const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+      const fromCompact = normalizeDateCompact(from);
+      const toCompact = normalizeDateCompact(to);
+      const baseDate = toCompact || fromCompact || normalizeDateCompact(new Date().toISOString().slice(0, 10));
+      const range = clampDateRangeToMax30Days(fromCompact || baseDate, toCompact || baseDate);
+
+      const sessionId = await fetchEcountSession();
+      const apiBase = await fetchEcountApiBase(comCode);
+      const basePayload = {
+        PROD_CD: "",
+        CUST_CD: "",
+        ListParam: {
+          BASE_DATE_FROM: range.fromCompact,
+          BASE_DATE_TO: range.toCompact,
+          PAGE_CURRENT: 1,
+          PAGE_SIZE: 100
+        }
+      };
+      const target = normalizeSlipNoText(slipNo);
+      const seq = target.split("-").pop() || "";
+      const endpointErrors = [];
+      const skipBuiltinLineApis = shouldSkipBuiltinLineApis();
+      let usedEndpoint = "GetPurchasesOrderList";
+      let rawRows = [];
+
+      const listUrl = `${apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=${encodeURIComponent(sessionId)}`;
+      const listResp = await fetch(listUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(basePayload)
+      });
+      if (!listResp.ok) {
+        const txt = await listResp.text();
+        throw new Error(`발주 목록 조회 실패(${listResp.status}): ${txt.slice(0, 300)}`);
+      }
+      const listData = await listResp.json();
+      rawRows = extractArrayFromUnknown(listData);
+
+      const headerRaw = findMatchingRawOrderRow(rawRows, target, seq, range.toCompact);
+      const ordNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : "";
+      const ioNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
+      let matched = [];
+      let lineSource = "header-flat";
+      let nestedLineCount = 0;
+      let narrowListTried = false;
+
+      if (headerRaw) {
+        const nestedLines = extractNestedLineRowsFromOrderRow(headerRaw);
+        nestedLineCount = nestedLines.length;
+        if (nestedLines.length) {
+          const merged = mergeOrderHeaderWithLines(headerRaw, nestedLines);
+          matched = normalizeInboundPlanRows(merged, range.toCompact);
+          lineSource = "nested-lines";
+        }
+      }
+
+      if (!matched.length && headerRaw) {
+        const narrowAttempts = [];
+        if (ordNoRawEarly) {
+          narrowAttempts.push({
+            label: "ListParam.ORD_NO",
+            body: { ...basePayload, ListParam: { ...basePayload.ListParam, ORD_NO: ordNoRawEarly } }
+          });
+          narrowAttempts.push({ label: "root.ORD_NO", body: { ...basePayload, ORD_NO: ordNoRawEarly } });
+        }
+        if (ioNoRawEarly) {
+          narrowAttempts.push({
+            label: "ListParam.IO_NO",
+            body: { ...basePayload, ListParam: { ...basePayload.ListParam, IO_NO: ioNoRawEarly } }
+          });
+        }
+        for (const na of narrowAttempts) {
+          narrowListTried = true;
+          try {
+            const nr = await fetch(listUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: JSON.stringify(na.body)
+            });
+            if (!nr.ok) continue;
+            const nd = await nr.json();
+            const nrows = extractArrayFromUnknown(nd);
+            const h2 = findMatchingRawOrderRow(nrows, target, seq, range.toCompact) || nrows[0];
+            if (!h2) continue;
+            const nl = extractNestedLineRowsFromOrderRow(h2);
+            if (nl.length) {
+              nestedLineCount = nl.length;
+              matched = normalizeInboundPlanRows(mergeOrderHeaderWithLines(h2, nl), range.toCompact);
+              lineSource = `narrow-list-${na.label}`;
+              break;
+            }
+          } catch (_) {
+            // ignore narrow failures
+          }
+        }
+      }
+
+      const envLinePaths = parseInboundLineApiPathSpecs(process.env.ECOUNT_INBOUND_LINE_API_PATHS || "");
+      if (!matched.length && envLinePaths.length) {
+        const ordNoL = ordNoRawEarly || seq;
+        const ioNoL = ioNoRawEarly;
+        const bodiesL = buildLineLookupBodies(basePayload, slipNo, ordNoL, ioNoL);
+        outerEnvLines: for (const v2Path of envLinePaths) {
+          for (const body of bodiesL.length ? bodiesL : [basePayload]) {
+            try {
+              const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, v2Path, body);
+              if (!ok) {
+                endpointErrors.push(`${v2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
+                continue;
+              }
+              const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+              if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+                endpointErrors.push(`${v2Path}:no-item-lines`);
+                continue;
+              }
+              matched = cand;
+              usedEndpoint = v2Path;
+              lineSource = `env-line-api-${kind}`;
+              break outerEnvLines;
+            } catch (err) {
+              endpointErrors.push(`${v2Path}:network ${err?.message || String(err)}`);
+            }
+          }
+        }
+      }
+
+      const customDetailApi = String(process.env.ECOUNT_INBOUND_DETAIL_API || "").trim();
+      if (!matched.length && customDetailApi) {
+        const ordNoRaw = ordNoRawEarly || seq;
+        const ioNoRaw = ioNoRawEarly;
+        const customV2Path = customDetailApi.includes("/") ? customDetailApi.replace(/^\/+/, "") : `Purchases/${customDetailApi}`;
+        const customBodies = buildLineLookupBodies(basePayload, slipNo, ordNoRaw, ioNoRaw);
+        outerCustom: for (const body of customBodies.length ? customBodies : [basePayload]) {
+          try {
+            const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, customV2Path, body);
+            if (!ok) {
+              endpointErrors.push(`${customV2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
+              continue;
+            }
+            const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+            if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+              endpointErrors.push(`${customV2Path}:no-item-lines`);
+              continue;
+            }
+            matched = cand;
+            usedEndpoint = customV2Path;
+            lineSource = `custom-detail-api-${kind}`;
+            break outerCustom;
+          } catch (err) {
+            endpointErrors.push(`${customV2Path}:network ${err?.message || String(err)}`);
+          }
+        }
+      }
+
+      if (!matched.length && !skipBuiltinLineApis) {
+        const ordNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : seq;
+        const ioNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
+        const lineBodies = buildLineLookupBodies(basePayload, slipNo, ordNoRaw, ioNoRaw);
+        const purchaseMethods = [
+          "GetPurchases",
+          "GetPurchasesOrderDetail",
+          "GetPurchaseOrderDetail",
+          "GetPurchasesOrderInfo",
+          "GetPurchasesDetail"
+        ];
+        const extraModulePaths = [
+          "Purchases/GetReadPurchases",
+          "Purchases/ReadPurchases",
+          "Purchases/GetPurchasesList",
+          "Stock/GetPurchases",
+          "Inventory/GetPurchases",
+          "Inventory/GetPurchaseList"
+        ];
+        const detailAttempts = [];
+        for (const method of purchaseMethods) {
+          for (const body of lineBodies) {
+            detailAttempts.push({ path: `Purchases/${method}`, body });
+          }
+        }
+        for (const path of extraModulePaths) {
+          for (const body of lineBodies) {
+            detailAttempts.push({ path, body });
+          }
+        }
+
+        outerBuiltin: for (const c of detailAttempts) {
+          try {
+            const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, c.path, c.body);
+            if (!ok) {
+              endpointErrors.push(`${c.path}:(${status}) ${String(text || "").slice(0, 120)}`);
+              continue;
+            }
+            const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+            if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+              endpointErrors.push(`${c.path}:no-item-lines`);
+              continue;
+            }
+            matched = cand;
+            usedEndpoint = c.path;
+            lineSource = `detail-api-${kind}`;
+            break outerBuiltin;
+          } catch (err) {
+            endpointErrors.push(`${c.path}:network ${err?.message || String(err)}`);
+          }
+        }
+      }
+
+      if (!matched.length) {
+        const items = normalizeInboundPlanRows(rawRows, range.toCompact);
+        matched = items.filter((x) => normalizeSlipNoText(x.poNo) === target);
+        if (!matched.length) {
+          matched = items.filter((x) => normalizeSlipNoText(x.poNo).endsWith(`-${seq}`));
+        }
+        lineSource = "list-summary-fallback";
+      }
+
+      const lineLike = matched.filter((x) => {
+        const hasCode = String(x.itemCode || "").trim() !== "";
+        const hasQty = String(x.qty || "").trim() !== "";
+        const isSummaryTitle = /외\s*\d+건/.test(String(x.itemName || ""));
+        return (hasCode || hasQty) && !isSummaryTitle;
+      });
+      if (lineLike.length) matched = lineLike;
+
+      const lineSourceFinal = lineSource;
+      let hint = "";
+      if (lineSourceFinal === "list-summary-fallback") {
+        const parts = [
+          "발주 목록 API만으로는 품목 라인(행별 PROD_CD 등)이 없습니다. 이카운트 개발자센터 OAPI에서 「한 전표·다품목」 조회 API의 정확한 Module/Method 를 확인한 뒤 .env에 ECOUNT_INBOUND_LINE_API_PATHS 또는 ECOUNT_INBOUND_DETAIL_API 로 지정하세요. debug.headerSummary에 라인 배열 후보 키가 보이면 알려주시면 매핑을 이어갈 수 있습니다."
+        ];
+        if (endpointErrors.length) {
+          parts.push(
+            "endpointErrors: (404)·EXP00001·No HTTP resource 는 해당 존에 없는 URL, (412)·HTML 은 호출 제한·차단 가능성입니다."
+          );
+          if (!skipBuiltinLineApis) {
+            parts.push(
+              "시도가 많다면 .env의 ECOUNT_SKIP_BUILTIN_LINE_APIS=0 을 제거하고 서버를 재시작하세요(기본은 내장 후보 비활성)."
+            );
+          }
+        } else if (skipBuiltinLineApis) {
+          parts.push(
+            "내장 후보 API는 호출하지 않은 상태입니다(endpointErrors 비어 있음). 품목별 행은 문서에 맞는 경로를 ECOUNT_INBOUND_LINE_API_PATHS 등에 넣어야 합니다."
+          );
+        }
+        hint = parts.join(" ");
+      }
+
+      return sendJson(res, 200, {
+        item: matched[0] || null,
+        items: matched,
+        source: "ecount-live-detail",
+        debug: {
+          requestedSlipNo: slipNo,
+          countRaw: Array.isArray(rawRows) ? rawRows.length : 0,
+          countMatched: matched.length,
+          usedEndpoint,
+          lineSource: lineSourceFinal,
+          hasHeaderRaw: Boolean(headerRaw),
+          nestedLineCount,
+          narrowListTried,
+          headerSummary: buildHeaderDebugSummary(headerRaw),
+          customDetailApi: String(process.env.ECOUNT_INBOUND_DETAIL_API || "").trim() || null,
+          inboundLineApiPaths: parseInboundLineApiPathSpecs(process.env.ECOUNT_INBOUND_LINE_API_PATHS || ""),
+          skipBuiltinLineApis,
+          hint,
+          endpointErrorAttempts: endpointErrors.length,
+          endpointErrors: compressEndpointErrorsForDebug(endpointErrors, 14)
         }
       });
     } catch (e) {

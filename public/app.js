@@ -1,4 +1,16 @@
-const views = ["dashboard", "master", "products", "stock", "inbound", "inbound-plan", "outbound", "adjust", "history", "alert"];
+const views = [
+  "dashboard",
+  "master",
+  "products",
+  "stock",
+  "inbound",
+  "inbound-plan",
+  "inbound-plan-2",
+  "outbound",
+  "adjust",
+  "history",
+  "alert"
+];
 const LAST_VIEW_KEY = "wms:lastView";
 const PRODUCT_HIDDEN_COLS_KEY = "wms:productHiddenCols";
 const TABLE_FILTER_MEMORY = {};
@@ -35,6 +47,14 @@ function formatYmd(v) {
   const digits = raw.replace(/\D/g, "");
   if (digits.length !== 8) return raw;
   return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+}
+
+/** YYYY/MM/DD 또는 YYYYMMDD 등 날짜 표시용 */
+function formatYmdLoose(v) {
+  const s = String(v || "").trim();
+  const m = s.match(/^(\d{4})\/(\d{2})\/(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  return formatYmd(v);
 }
 
 function toTagList(v) {
@@ -362,6 +382,25 @@ function parseSheet(file) {
         const ws = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
         resolve(rows);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/** 첫 시트를 2차원 배열로 (발주서현황 업로드용) */
+function parseSheetAsMatrix(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        resolve({ matrix, sourceFileName: file.name || "upload.xlsx" });
       } catch (err) {
         reject(err);
       }
@@ -1848,8 +1887,8 @@ async function renderInboundPlan() {
   const to = today.toISOString().slice(0, 10);
   wrap.innerHTML = `
     <div class="card">
-      <h2>입고예정목록</h2>
-      <p class="muted">이카운트 발주 데이터를 읽기 전용으로 조회합니다.</p>
+      <h2>입고예정목록 1</h2>
+      <p class="muted">이카운트 OAPI로 발주 데이터를 읽기 전용 조회합니다.</p>
       <div class="row" style="grid-template-columns: 180px 180px 100px 1fr;">
         <input id="inbound-plan-from" type="date" value="${from}" />
         <input id="inbound-plan-to" type="date" value="${to}" />
@@ -1860,9 +1899,163 @@ async function renderInboundPlan() {
     <div class="card">
       <div id="inbound-plan-table-wrap" class="muted">조회 버튼을 눌러주세요.</div>
     </div>
+    <div id="inbound-plan-detail-overlay" class="modal-overlay hidden">
+      <div class="modal" style="width: min(760px, calc(100vw - 24px));">
+        <div class="modal-header">
+          <h3 id="inbound-plan-detail-title">전표 상세</h3>
+          <button type="button" id="inbound-plan-detail-close" class="cancel-btn del-small">닫기</button>
+        </div>
+        <div id="inbound-plan-detail-body" style="max-height: 65vh; overflow: auto;"></div>
+      </div>
+    </div>
   `;
 
   let inboundPlanQuerySeq = 0;
+  let inboundPlanItems = [];
+  const detailOverlay = qs("#inbound-plan-detail-overlay");
+  const detailBody = qs("#inbound-plan-detail-body");
+  const detailTitle = qs("#inbound-plan-detail-title");
+  const closeDetail = () => detailOverlay?.classList.add("hidden");
+  qs("#inbound-plan-detail-close")?.addEventListener("click", closeDetail);
+  detailOverlay?.addEventListener("click", (e) => {
+    if (e.target === detailOverlay) closeDetail();
+  });
+
+  const renderDetail = async (item) => {
+    if (!item || !detailBody) return;
+    const slipNo = String(item.poNo || "");
+    if (!slipNo) return;
+    const fromDate = String(qs("#inbound-plan-from")?.value || "");
+    const toDate = String(qs("#inbound-plan-to")?.value || "");
+    if (detailTitle) detailTitle.textContent = `전표 상세 - ${slipNo || "-"}`;
+    detailBody.innerHTML = `<p class="muted">전표 상세를 조회 중입니다...</p>`;
+    detailOverlay?.classList.remove("hidden");
+
+    let lines = [];
+    let head = item;
+    let detailRes = null;
+    let fetchErrorHtml = "";
+    const fallbackLines = inboundPlanItems.filter((x) => String(x.poNo || "") === slipNo);
+    const detailTimeoutMs = 120000;
+    try {
+      const q = `slipNo=${encodeURIComponent(slipNo)}&from=${encodeURIComponent(fromDate)}&to=${encodeURIComponent(toDate)}`;
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), detailTimeoutMs);
+      try {
+        detailRes = await api(`/api/inbound-plans/detail?${q}`, { signal: ac.signal });
+      } finally {
+        clearTimeout(t);
+      }
+      lines = Array.isArray(detailRes.items) ? detailRes.items : [];
+      head = detailRes.item || lines[0] || item;
+    } catch (err) {
+      // ECOUNT can rate-limit repeated requests(412). Fall back to current list rows.
+      lines = fallbackLines;
+      head = lines[0] || item;
+      const aborted = err && (err.name === "AbortError" || /aborted/i.test(String(err.message || "")));
+      const errMsg = esc(
+        aborted
+          ? `응답 시간 초과(${Math.round(detailTimeoutMs / 1000)}초). 서버·이카운트 부하를 줄이고 다시 시도하세요.`
+          : err.message || "오류"
+      );
+      fetchErrorHtml = `<p class="muted" style="margin-bottom:8px;">상세 API 재조회 실패로 현재 목록 데이터로 표시합니다. (${errMsg})</p>`;
+    }
+    if (detailTitle) detailTitle.textContent = `전표 상세 - ${slipNo || "-"}`;
+
+    const qtyText = (v) => {
+      const n = Number(String(v ?? "").replace(/,/g, ""));
+      return Number.isFinite(n) ? n.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(v || "");
+    };
+    const lineRows = lines
+      .map(
+        (r, idx) => `<tr>
+          <td>${idx + 1}</td>
+          <td>${esc(r.itemCode || "")}</td>
+          <td>${esc(r.barcode || "")}</td>
+          <td>${esc(r.itemName || "")}</td>
+          <td>${esc(r.spec || "")}</td>
+          <td>${esc(qtyText(r.boxQty || ""))}</td>
+          <td>${esc(qtyText(r.qty || ""))}</td>
+          <td>${esc(r.remark || "")}</td>
+          <td>${esc(r.note || "")}</td>
+        </tr>`
+      )
+      .join("");
+
+    const dbg = detailRes?.debug;
+    const summaryLine =
+      lines.length === 1 &&
+      /외\s*\d+건/.test(String(lines[0]?.itemName || "")) &&
+      !String(lines[0]?.itemCode || "").trim();
+    const summaryHint = summaryLine
+      ? `<p class="muted" style="margin-bottom:10px;font-size:13px;">품목명이 「…외 N건」 형태면 이카운트 발주 목록만 반영된 요약입니다. 품목별 행·코드는 구매/입고 라인 API 연동 또는 <code style="font-size:12px;">ECOUNT_INBOUND_LINE_API_PATHS</code> 설정 후 재조회가 필요합니다.</p>`
+      : "";
+
+    let debugHtml = "";
+    if (dbg && typeof dbg === "object") {
+      const ep = Array.isArray(dbg.endpointErrors) ? dbg.endpointErrors : [];
+      const epHtml = ep.length
+        ? `<ul style="margin:6px 0 0;padding-left:18px;font-size:12px;">${ep.map((e) => `<li>${esc(String(e))}</li>`).join("")}</ul>`
+        : "";
+      debugHtml = `
+        <details style="margin-top:14px;" class="muted">
+          <summary style="cursor:pointer;font-size:13px;">이카운트 상세 조회 디버그 (usedEndpoint / endpointErrors)</summary>
+          <div style="margin-top:8px;font-size:12px;line-height:1.45;">
+            <div><strong>usedEndpoint</strong>: ${esc(String(dbg.usedEndpoint ?? "(없음)"))}</div>
+            <div><strong>lineSource</strong>: ${esc(String(dbg.lineSource ?? ""))}</div>
+            <div><strong>nestedLineCount</strong>: ${esc(String(dbg.nestedLineCount ?? ""))}</div>
+            ${
+              dbg.endpointErrorAttempts != null
+                ? `<div><strong>endpointErrorAttempts</strong>: ${esc(String(dbg.endpointErrorAttempts))} (압축 전 시도 횟수)</div>`
+                : ""
+            }
+            ${
+              dbg.skipBuiltinLineApis != null
+                ? `<div><strong>skipBuiltinLineApis</strong>: ${esc(String(dbg.skipBuiltinLineApis))} — ${
+                    dbg.skipBuiltinLineApis
+                      ? "내장 후보 API 자동 호출 안 함(기본). 켜려면 .env에 ECOUNT_SKIP_BUILTIN_LINE_APIS=0 후 서버 재시작."
+                      : "내장 후보 API 자동 호출 중(.env ECOUNT_SKIP_BUILTIN_LINE_APIS=0). 끄려면 해당 줄을 제거 후 재시작."
+                  }</div>`
+                : ""
+            }
+            ${dbg.hint ? `<div style="margin-top:6px;"><strong>hint</strong>: ${esc(String(dbg.hint))}</div>` : ""}
+            ${ep.length ? `<div style="margin-top:6px;"><strong>endpointErrors</strong>:</div>${epHtml}` : `<div style="margin-top:6px;">endpointErrors: 없음</div>`}
+          </div>
+        </details>
+      `;
+    }
+
+    detailBody.innerHTML = `${fetchErrorHtml}${summaryHint}
+      <div class="row" style="grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 8px; margin-bottom: 12px;">
+        <div><strong>전표번호</strong><div>${esc(slipNo || "-")}</div></div>
+        <div><strong>일자</strong><div>${esc(formatYmd(head.poDate || ""))}</div></div>
+        <div><strong>거래처</strong><div>${esc(head.vendor || "")}</div></div>
+        <div><strong>담당자</strong><div>${esc(head.manager || "")}</div></div>
+        <div><strong>입고창고</strong><div>${esc(head.whName || "")}</div></div>
+        <div><strong>통화</strong><div>${esc(head.currency || "내자")}</div></div>
+        <div><strong>납기일자</strong><div>${esc(formatYmd(head.dueDate || ""))}</div></div>
+        <div><strong>상태</strong><div>${esc(head.status || "")}</div></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>순번</th>
+            <th>품목코드</th>
+            <th>바코드</th>
+            <th>품목명</th>
+            <th>규격</th>
+            <th>수량(BOX)</th>
+            <th>수량</th>
+            <th>적요</th>
+            <th>비고</th>
+          </tr>
+        </thead>
+        <tbody>${lineRows || `<tr><td colspan="9" class="muted">품목 라인 정보가 없습니다.</td></tr>`}</tbody>
+      </table>
+    ${debugHtml}`;
+    detailOverlay?.classList.remove("hidden");
+  };
+
   const draw = async () => {
     const currentSeq = ++inboundPlanQuerySeq;
     const fromEl = qs("#inbound-plan-from");
@@ -1880,6 +2073,7 @@ async function renderInboundPlan() {
       // Ignore stale responses from earlier requests.
       if (currentSeq !== inboundPlanQuerySeq) return;
       const items = Array.isArray(res.items) ? res.items : [];
+      inboundPlanItems = items;
       if (statusEl) {
         const extra = res?.debug?.countRaw ? ` (원본 ${res.debug.countRaw})` : "";
         statusEl.textContent = `총 ${items.length}건${extra}`;
@@ -1906,7 +2100,7 @@ async function renderInboundPlan() {
             const qtyText = Number.isFinite(qtyNum) ? qtyNum.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(x.qty || "");
             return `<tr>
             <td>${idx + 1}</td>
-            <td>${esc(x.poNo || "")}</td>
+            <td><button type="button" class="bh-link-btn inbound-plan-open-detail" data-idx="${idx}">${esc(x.poNo || "")}</button></td>
             <td>${esc(formatYmd(x.poDate || ""))}</td>
             <td>${esc(x.vendor || "")}</td>
             <td>${esc(x.manager || "")}</td>
@@ -1940,6 +2134,13 @@ async function renderInboundPlan() {
       `;
       delete TABLE_FILTER_MEMORY["#inbound-plan-table"];
       applyExcelLikeFilter("#inbound-plan-table");
+      tableWrap.querySelectorAll(".inbound-plan-open-detail").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const idx = Number(btn.getAttribute("data-idx"));
+          if (!Number.isInteger(idx) || idx < 0) return;
+          await renderDetail(inboundPlanItems[idx]);
+        });
+      });
     } catch (err) {
       if (currentSeq !== inboundPlanQuerySeq) return;
       if (statusEl) statusEl.textContent = "조회 실패";
@@ -1950,6 +2151,223 @@ async function renderInboundPlan() {
   };
 
   qs("#inbound-plan-search").onclick = () => draw();
+}
+
+async function renderInboundPlan2() {
+  const wrap = qs("#view-inbound-plan-2");
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div class="card">
+      <h2>입고예정목록 2</h2>
+      <p class="muted">이카운트 ERP에서 「발주서현황」을 엑셀 저장한 파일(.xlsx)을 올리면 품목 라인까지 목록·전표 상세로 볼 수 있습니다. (구매입력 연동은 추후)</p>
+      <div class="row" style="grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;">
+        <input type="file" id="inbound-plan-2-file" accept=".xlsx,.xls" />
+        <button type="button" id="inbound-plan-2-upload" class="primary">업로드·반영</button>
+        <button type="button" id="inbound-plan-2-refresh" class="cancel-btn">목록 새로고침</button>
+      </div>
+      <div id="inbound-plan-2-meta" class="muted" style="margin-top:8px;"></div>
+    </div>
+    <div class="card">
+      <div id="inbound-plan-2-table-wrap" class="muted">파일을 업로드하거나 새로고침 하세요.</div>
+    </div>
+    <div id="inbound-plan-2-detail-overlay" class="modal-overlay hidden">
+      <div class="modal" style="width: min(920px, calc(100vw - 24px));">
+        <div class="modal-header">
+          <h3 id="inbound-plan-2-detail-title">전표 상세 (업로드)</h3>
+          <button type="button" id="inbound-plan-2-detail-close" class="cancel-btn del-small">닫기</button>
+        </div>
+        <div id="inbound-plan-2-detail-body" style="max-height: 65vh; overflow: auto;"></div>
+      </div>
+    </div>
+  `;
+
+  let inboundPlan2Items = [];
+  const detailOverlay = qs("#inbound-plan-2-detail-overlay");
+  const detailBody = qs("#inbound-plan-2-detail-body");
+  const detailTitle = qs("#inbound-plan-2-detail-title");
+  const metaEl = qs("#inbound-plan-2-meta");
+  const tableWrap = qs("#inbound-plan-2-table-wrap");
+
+  const closeDetail = () => detailOverlay?.classList.add("hidden");
+  qs("#inbound-plan-2-detail-close")?.addEventListener("click", closeDetail);
+  detailOverlay?.addEventListener("click", (e) => {
+    if (e.target === detailOverlay) closeDetail();
+  });
+
+  const qtyText = (v) => {
+    const n = Number(String(v ?? "").replace(/,/g, ""));
+    return Number.isFinite(n) ? n.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(v || "");
+  };
+
+  const renderDetail = async (listRow) => {
+    if (!listRow || !detailBody) return;
+    const slipNo = String(listRow.poNo || "");
+    if (!slipNo) return;
+    if (detailTitle) detailTitle.textContent = `전표 상세 - ${slipNo}`;
+    detailBody.innerHTML = `<p class="muted">불러오는 중…</p>`;
+    detailOverlay?.classList.remove("hidden");
+    let lines = [];
+    let head = listRow;
+    try {
+      const res = await api(`/api/inbound-plan-upload/detail?slipNo=${encodeURIComponent(slipNo)}`);
+      lines = Array.isArray(res.items) ? res.items : [];
+      head = res.item || lines[0] || listRow;
+    } catch (err) {
+      detailBody.innerHTML = `<p class="muted">${esc(err.message || "오류")}</p>`;
+      return;
+    }
+    const lineRows = lines
+      .map(
+        (r, idx) => `<tr>
+          <td>${idx + 1}</td>
+          <td>${esc(r.itemCode || "")}</td>
+          <td>${esc(r.barcode || "")}</td>
+          <td>${esc(r.itemName || "")}</td>
+          <td>${esc(r.spec || "")}</td>
+          <td>${esc(qtyText(r.boxQty || ""))}</td>
+          <td>${esc(qtyText(r.qty || ""))}</td>
+          <td>${esc(qtyText(r.unitPrice ?? ""))}</td>
+          <td>${esc(qtyText(r.supplyAmount ?? ""))}</td>
+          <td>${esc(r.vendorCode || "")}</td>
+          <td>${esc(r.remark || "")}</td>
+          <td>${esc(r.note || "")}</td>
+        </tr>`
+      )
+      .join("");
+    detailBody.innerHTML = `
+      <p class="muted" style="margin-bottom:10px;">업로드 파일 기준 데이터입니다.</p>
+      <div class="row" style="grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 8px; margin-bottom: 12px;">
+        <div><strong>전표번호</strong><div>${esc(slipNo || "-")}</div></div>
+        <div><strong>일자</strong><div>${esc(formatYmdLoose(head.poDate || ""))}</div></div>
+        <div><strong>거래처</strong><div>${esc(head.vendor || "")}</div></div>
+        <div><strong>거래처코드</strong><div>${esc(head.vendorCode || "")}</div></div>
+        <div><strong>담당자</strong><div>${esc(head.manager || "")}</div></div>
+        <div><strong>입고창고</strong><div>${esc(head.whName || "")}</div></div>
+        <div><strong>납기일자</strong><div>${esc(formatYmdLoose(head.dueDate || ""))}</div></div>
+        <div><strong>품목 행 수</strong><div>${lines.length}</div></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>순번</th>
+            <th>품목코드</th>
+            <th>바코드</th>
+            <th>품목명</th>
+            <th>규격</th>
+            <th>수량(BOX)</th>
+            <th>수량</th>
+            <th>단가</th>
+            <th>공급가액</th>
+            <th>거래처코드</th>
+            <th>적요</th>
+            <th>비고</th>
+          </tr>
+        </thead>
+        <tbody>${lineRows || `<tr><td colspan="12" class="muted">품목 라인이 없습니다.</td></tr>`}</tbody>
+      </table>
+    `;
+  };
+
+  const drawTable = () => {
+    if (!tableWrap) return;
+    if (!inboundPlan2Items.length) {
+      tableWrap.innerHTML = `<span class="muted">표시할 전표가 없습니다. 엑셀을 업로드하세요.</span>`;
+      return;
+    }
+    const rows = inboundPlan2Items
+      .map(
+        (x, idx) => {
+          const qtyNum = Number(String(x.qty ?? "").replace(/,/g, ""));
+          const qtyDisp = Number.isFinite(qtyNum) ? qtyNum.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(x.qty || "");
+          return `<tr>
+            <td>${idx + 1}</td>
+            <td><button type="button" class="bh-link-btn inbound-plan-2-open-detail" data-idx="${idx}">${esc(x.poNo || "")}</button></td>
+            <td>${esc(formatYmdLoose(x.poDate || ""))}</td>
+            <td>${esc(x.vendor || "")}</td>
+            <td>${esc(x.manager || "")}</td>
+            <td>${esc(x.itemName || "")}</td>
+            <td>${esc(qtyDisp)}</td>
+            <td>${esc(formatYmdLoose(x.dueDate || ""))}</td>
+            <td>${esc(x.whName || "")}</td>
+            <td>${esc(String(x.lineCount || ""))}</td>
+          </tr>`;
+        }
+      )
+      .join("");
+    tableWrap.innerHTML = `
+      <table id="inbound-plan-2-table">
+        <thead>
+          <tr>
+            <th>순번</th>
+            <th>발주번호</th>
+            <th>발주일자</th>
+            <th>거래처</th>
+            <th>담당자</th>
+            <th>품목요약</th>
+            <th>수량합계</th>
+            <th>납기일</th>
+            <th>창고</th>
+            <th>품목행수</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+    delete TABLE_FILTER_MEMORY["#inbound-plan-2-table"];
+    applyExcelLikeFilter("#inbound-plan-2-table");
+    tableWrap.querySelectorAll(".inbound-plan-2-open-detail").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = Number(btn.getAttribute("data-idx"));
+        if (!Number.isInteger(idx) || idx < 0) return;
+        await renderDetail(inboundPlan2Items[idx]);
+      });
+    });
+  };
+
+  const loadList = async () => {
+    try {
+      const res = await api("/api/inbound-plan-upload");
+      inboundPlan2Items = Array.isArray(res.items) ? res.items : [];
+      if (metaEl) {
+        const fn = res.sourceFileName ? esc(res.sourceFileName) : "-";
+        const at = res.uploadedAt ? esc(res.uploadedAt.slice(0, 19).replace("T", " ")) : "-";
+        metaEl.innerHTML = `저장된 파일: <strong>${fn}</strong> · 반영 시각: ${at} · 품목 행 <strong>${Number(res.lineCount || 0)}</strong> · 전표 <strong>${inboundPlan2Items.length}</strong>`;
+      }
+      drawTable();
+    } catch (e) {
+      if (metaEl) metaEl.textContent = "";
+      tableWrap.innerHTML = `<span class="muted">${esc(e.message || "목록 조회 실패")}</span>`;
+    }
+  };
+
+  qs("#inbound-plan-2-refresh")?.addEventListener("click", () => loadList());
+  qs("#inbound-plan-2-upload")?.addEventListener("click", async () => {
+    const input = qs("#inbound-plan-2-file");
+    const file = input?.files?.[0];
+    if (!file) {
+      alert("엑셀 파일을 선택하세요.");
+      return;
+    }
+    try {
+      const { matrix, sourceFileName } = await parseSheetAsMatrix(file);
+      const res = await api("/api/inbound-plan-upload", {
+        method: "POST",
+        body: JSON.stringify({ matrix, sourceFileName })
+      });
+      inboundPlan2Items = Array.isArray(res.items) ? res.items : [];
+      if (metaEl) {
+        const fn = esc(res.sourceFileName || sourceFileName);
+        const at = res.uploadedAt ? esc(res.uploadedAt.slice(0, 19).replace("T", " ")) : "";
+        metaEl.innerHTML = `저장된 파일: <strong>${fn}</strong> · 반영 시각: ${at} · 품목 행 <strong>${Number(res.lineCount || 0)}</strong> · 전표 <strong>${res.slipCount ?? inboundPlan2Items.length}</strong>`;
+      }
+      drawTable();
+      alert(`반영 완료: 전표 ${res.slipCount ?? inboundPlan2Items.length}건, 품목 행 ${res.lineCount ?? 0}건`);
+    } catch (e) {
+      alert(e.message || "업로드 실패");
+    }
+  });
+
+  await loadList();
 }
 
 function renderOutbound() {
@@ -2227,6 +2645,7 @@ async function init() {
       if (v === "stock") renderStock();
       if (v === "inbound") renderInbound();
       if (v === "inbound-plan") await renderInboundPlan();
+      if (v === "inbound-plan-2") await renderInboundPlan2();
       if (v === "outbound") renderOutbound();
       if (v === "adjust") renderAdjust();
       if (v === "history") await renderHistory();
@@ -2241,6 +2660,7 @@ async function init() {
   renderStock();
   renderInbound();
   await renderInboundPlan();
+  await renderInboundPlan2();
   renderOutbound();
   renderAdjust();
   await renderHistory();
