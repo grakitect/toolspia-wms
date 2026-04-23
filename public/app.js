@@ -57,6 +57,33 @@ function formatYmdLoose(v) {
   return formatYmd(v);
 }
 
+function normalizeDateTimeDigits(v) {
+  return String(v || "")
+    .trim()
+    .replace(/[^\d]/g, "");
+}
+
+/** 브라우저 로컬 날짜 기준 YYYY-MM-DD (date input·API 신규 확인 기간용) */
+function localDateYmd(d) {
+  const x = d instanceof Date ? d : new Date(d);
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, "0");
+  const day = String(x.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function normalizeSlipNoText(v) {
+  const s = String(v || "").trim();
+  if (!s) return "";
+  const compact = s.replace(/\s+/g, "");
+  const m = compact.match(/^(\d{2}|\d{4})\/?(\d{2})\/?(\d{2})-(\d+)$/);
+  if (m) {
+    const yy = m[1].length === 4 ? m[1].slice(2) : m[1];
+    return `${yy}/${m[2]}/${m[3]}-${String(Number(m[4]))}`;
+  }
+  return compact;
+}
+
 function toTagList(v) {
   if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
   return String(v || "")
@@ -2156,16 +2183,39 @@ async function renderInboundPlan() {
 async function renderInboundPlan2() {
   const wrap = qs("#view-inbound-plan-2");
   if (!wrap) return;
+  const today = new Date();
+  const defaultApiTo = localDateYmd(today);
+  const defaultApiFrom = localDateYmd(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 30));
+  let apiFrom = defaultApiFrom;
+  let apiTo = defaultApiTo;
+  try {
+    const sF = localStorage.getItem("inbound-plan-2-api-from");
+    const sT = localStorage.getItem("inbound-plan-2-api-to");
+    if (sF && /^\d{4}-\d{2}-\d{2}$/.test(sF)) apiFrom = sF;
+    if (sT && /^\d{4}-\d{2}-\d{2}$/.test(sT)) apiTo = sT;
+  } catch (_) {
+    /* ignore */
+  }
   wrap.innerHTML = `
     <div class="card">
-      <h2>입고예정목록 2</h2>
-      <p class="muted">이카운트 ERP에서 「발주서현황」을 엑셀 저장한 파일(.xlsx)을 올리면 품목 라인까지 목록·전표 상세로 볼 수 있습니다. (구매입력 연동은 추후)</p>
-      <div class="row" style="grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;">
+      <h2>입고예정목록 2 <span id="inbound-plan-2-new-badge"></span></h2>
+      <p class="muted">이카운트 ERP에서 「발주서현황」을 엑셀 저장한 파일(.xlsx)을 올리면 품목 라인까지 목록·전표 상세로 볼 수 있습니다. 이미 저장된 <strong>발주번호(일자-No.)</strong>와 같은 전표는 덮어쓰지 않고 건너뛰며, <strong>신규 발주만</strong> 추가됩니다.</p>
+      <div class="row" style="grid-template-columns: 1fr auto auto auto auto; gap: 10px; align-items: center;">
         <input type="file" id="inbound-plan-2-file" accept=".xlsx,.xls" />
         <button type="button" id="inbound-plan-2-upload" class="primary">업로드·반영</button>
         <button type="button" id="inbound-plan-2-refresh" class="cancel-btn">목록 새로고침</button>
+        <button type="button" id="inbound-plan-2-check-new" class="cancel-btn">API 신규 확인</button>
+        <button type="button" id="inbound-plan-2-delete-selected" class="cancel-btn">선택 삭제</button>
+      </div>
+      <div class="row" style="display: grid; grid-template-columns: auto 170px auto 170px 1fr; align-items: center; gap: 8px; margin-top: 10px;">
+        <span class="muted" style="white-space: nowrap;">신규 확인(API) 조회 기간</span>
+        <input type="date" id="inbound-plan-2-api-from" value="${esc(apiFrom)}" style="width:170px;" />
+        <span class="muted">~</span>
+        <input type="date" id="inbound-plan-2-api-to" value="${esc(apiTo)}" style="width:170px;" />
+        <span class="muted" style="font-size: 12px; white-space: nowrap;">이카운트 발주서 조회 구간(BASE_DATE) · <strong>입고예정목록 1</strong>과 별도입니다.</span>
       </div>
       <div id="inbound-plan-2-meta" class="muted" style="margin-top:8px;"></div>
+      <div id="inbound-plan-2-api-status" class="muted" style="margin-top:4px;"></div>
     </div>
     <div class="card">
       <div id="inbound-plan-2-table-wrap" class="muted">파일을 업로드하거나 새로고침 하세요.</div>
@@ -2182,11 +2232,14 @@ async function renderInboundPlan2() {
   `;
 
   let inboundPlan2Items = [];
+  let selectedSlipKeys = new Set();
   const detailOverlay = qs("#inbound-plan-2-detail-overlay");
   const detailBody = qs("#inbound-plan-2-detail-body");
   const detailTitle = qs("#inbound-plan-2-detail-title");
   const metaEl = qs("#inbound-plan-2-meta");
   const tableWrap = qs("#inbound-plan-2-table-wrap");
+  const apiStatusEl = qs("#inbound-plan-2-api-status");
+  const newBadgeEl = qs("#inbound-plan-2-new-badge");
 
   const closeDetail = () => detailOverlay?.classList.add("hidden");
   qs("#inbound-plan-2-detail-close")?.addEventListener("click", closeDetail);
@@ -2244,6 +2297,7 @@ async function renderInboundPlan2() {
         <div><strong>담당자</strong><div>${esc(head.manager || "")}</div></div>
         <div><strong>입고창고</strong><div>${esc(head.whName || "")}</div></div>
         <div><strong>납기일자</strong><div>${esc(formatYmdLoose(head.dueDate || ""))}</div></div>
+        <div><strong>최종수정일자</strong><div>${esc(head.lastModifiedAt || "")}</div></div>
         <div><strong>품목 행 수</strong><div>${lines.length}</div></div>
       </div>
       <table>
@@ -2280,6 +2334,9 @@ async function renderInboundPlan2() {
           const qtyNum = Number(String(x.qty ?? "").replace(/,/g, ""));
           const qtyDisp = Number.isFinite(qtyNum) ? qtyNum.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) : String(x.qty || "");
           return `<tr>
+            <td><input type="checkbox" class="inbound-plan-2-row-check" data-slip="${esc(x.poNo || "")}" ${
+              selectedSlipKeys.has(normalizeSlipNoText(x.poNo)) ? "checked" : ""
+            } /></td>
             <td>${idx + 1}</td>
             <td><button type="button" class="bh-link-btn inbound-plan-2-open-detail" data-idx="${idx}">${esc(x.poNo || "")}</button></td>
             <td>${esc(formatYmdLoose(x.poDate || ""))}</td>
@@ -2289,6 +2346,7 @@ async function renderInboundPlan2() {
             <td>${esc(qtyDisp)}</td>
             <td>${esc(formatYmdLoose(x.dueDate || ""))}</td>
             <td>${esc(x.whName || "")}</td>
+            <td>${esc(x.lastModifiedAt || "")}</td>
             <td>${esc(String(x.lineCount || ""))}</td>
           </tr>`;
         }
@@ -2298,6 +2356,7 @@ async function renderInboundPlan2() {
       <table id="inbound-plan-2-table">
         <thead>
           <tr>
+            <th><input type="checkbox" id="inbound-plan-2-check-all" /></th>
             <th>순번</th>
             <th>발주번호</th>
             <th>발주일자</th>
@@ -2307,12 +2366,35 @@ async function renderInboundPlan2() {
             <th>수량합계</th>
             <th>납기일</th>
             <th>창고</th>
+            <th>최종수정일자</th>
             <th>품목행수</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
     `;
+    const checkAll = qs("#inbound-plan-2-check-all");
+    const rowChecks = Array.from(tableWrap.querySelectorAll(".inbound-plan-2-row-check"));
+    if (checkAll) {
+      const allChecked = rowChecks.length > 0 && rowChecks.every((el) => el.checked);
+      checkAll.checked = allChecked;
+      checkAll.addEventListener("change", () => {
+        selectedSlipKeys = new Set();
+        rowChecks.forEach((el) => {
+          el.checked = checkAll.checked;
+          if (checkAll.checked) selectedSlipKeys.add(normalizeSlipNoText(el.getAttribute("data-slip")));
+        });
+      });
+    }
+    rowChecks.forEach((el) => {
+      el.addEventListener("change", () => {
+        const k = normalizeSlipNoText(el.getAttribute("data-slip"));
+        if (!k) return;
+        if (el.checked) selectedSlipKeys.add(k);
+        else selectedSlipKeys.delete(k);
+        if (checkAll) checkAll.checked = rowChecks.length > 0 && rowChecks.every((x) => x.checked);
+      });
+    });
     delete TABLE_FILTER_MEMORY["#inbound-plan-2-table"];
     applyExcelLikeFilter("#inbound-plan-2-table");
     tableWrap.querySelectorAll(".inbound-plan-2-open-detail").forEach((btn) => {
@@ -2328,6 +2410,9 @@ async function renderInboundPlan2() {
     try {
       const res = await api("/api/inbound-plan-upload");
       inboundPlan2Items = Array.isArray(res.items) ? res.items : [];
+      selectedSlipKeys = new Set(
+        Array.from(selectedSlipKeys).filter((k) => inboundPlan2Items.some((x) => normalizeSlipNoText(x.poNo) === k))
+      );
       if (metaEl) {
         const fn = res.sourceFileName ? esc(res.sourceFileName) : "-";
         const at = res.uploadedAt ? esc(res.uploadedAt.slice(0, 19).replace("T", " ")) : "-";
@@ -2340,7 +2425,162 @@ async function renderInboundPlan2() {
     }
   };
 
+  const checkApiNewSlips = async () => {
+    const fromEl = qs("#inbound-plan-2-api-from");
+    const toEl = qs("#inbound-plan-2-api-to");
+    let from = String(fromEl?.value || "").trim();
+    let to = String(toEl?.value || "").trim();
+    if (!from || !to) {
+      alert("신규 확인(API) 조회 기간의 시작일·종료일을 모두 선택하세요.");
+      return;
+    }
+    if (from > to) {
+      const tmp = from;
+      from = to;
+      to = tmp;
+      if (fromEl) fromEl.value = from;
+      if (toEl) toEl.value = to;
+    }
+    try {
+      localStorage.setItem("inbound-plan-2-api-from", from);
+      localStorage.setItem("inbound-plan-2-api-to", to);
+    } catch (_) {
+      /* ignore */
+    }
+
+    if (apiStatusEl) apiStatusEl.textContent = `이카운트 발주 API 조회 중… (${from} ~ ${to})`;
+    if (newBadgeEl) newBadgeEl.innerHTML = "";
+    try {
+      const res = await api(`/api/inbound-plans?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+      const apiItems = Array.isArray(res.items) ? res.items : [];
+      const adj = res.debug && res.debug.adjustedDateRange;
+      const adjNote =
+        adj && adj.from && adj.to
+          ? ` · 서버 적용 구간 ${formatYmd(adj.from)} ~ ${formatYmd(adj.to)}(최대 30일로 자동 축소됨)`
+          : "";
+      const uploadedMap = new Map();
+      inboundPlan2Items.forEach((x) => {
+        const k = normalizeSlipNoText(x.poNo);
+        if (!k) return;
+        uploadedMap.set(k, {
+          poNo: x.poNo || "",
+          lastModifiedKey: normalizeDateTimeDigits(x.lastModifiedAt),
+          lastModifiedAt: String(x.lastModifiedAt || "")
+        });
+      });
+      const newItems = [];
+      const modifiedItems = [];
+      apiItems.forEach((x) => {
+        const k = normalizeSlipNoText(x.poNo);
+        if (!k) return;
+        const apiLastModifiedKey = normalizeDateTimeDigits(x.lastModifiedAt);
+        const uploaded = uploadedMap.get(k);
+        if (!uploaded) {
+          newItems.push(x);
+          return;
+        }
+        if (uploaded.lastModifiedKey && apiLastModifiedKey && apiLastModifiedKey > uploaded.lastModifiedKey) {
+          modifiedItems.push({
+            poNo: x.poNo || uploaded.poNo || "",
+            apiLastModifiedAt: x.lastModifiedAt || "",
+            uploadedLastModifiedAt: uploaded.lastModifiedAt || ""
+          });
+        }
+      });
+      if (newItems.length || modifiedItems.length) {
+        const newSample = newItems
+          .slice(0, 5)
+          .map((x) => x.poNo)
+          .filter(Boolean)
+          .join(", ");
+        const modifiedSample = modifiedItems
+          .slice(0, 5)
+          .map((x) => x.poNo)
+          .filter(Boolean)
+          .join(", ");
+        const parts = [];
+        if (newItems.length) {
+          parts.push(
+            `<strong style="color:#b42318;">신규 발주서 ${newItems.length}건</strong> (입고예정목록 2 업로드 목록에 없음)${
+              newSample ? ` · 예: ${esc(newSample)}${newItems.length > 5 ? " …" : ""}` : ""
+            }`
+          );
+        }
+        if (modifiedItems.length) {
+          parts.push(
+            `<strong style="color:#1d4ed8;">수정 발주서 ${modifiedItems.length}건</strong> (동일 발주번호, API 최종수정일자 최신)${
+              modifiedSample ? ` · 예: ${esc(modifiedSample)}${modifiedItems.length > 5 ? " …" : ""}` : ""
+            }`
+          );
+        }
+        if (apiStatusEl) {
+          apiStatusEl.innerHTML = `${parts.join(" · ")}<span class="muted" style="font-weight:normal;font-size:12px;"> · 조회 ${esc(
+            from
+          )} ~ ${esc(to)}</span>${esc(adjNote)}`;
+        }
+        if (newBadgeEl) {
+          const badges = [];
+          if (newItems.length) {
+            badges.push(
+              '<span style="display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; background:#fee4e2; color:#b42318; font-size:12px; vertical-align:middle;">신규 ' +
+                newItems.length +
+                "건</span>"
+            );
+          }
+          if (modifiedItems.length) {
+            badges.push(
+              '<span style="display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; background:#dbeafe; color:#1d4ed8; font-size:12px; vertical-align:middle;">수정 ' +
+                modifiedItems.length +
+                "건</span>"
+            );
+          }
+          newBadgeEl.innerHTML = badges.join("");
+        }
+      } else if (apiStatusEl) {
+        apiStatusEl.innerHTML = `API 기준 신규/수정 발주서 없음 (업로드 목록이 해당 구간을 반영한 상태).<span class="muted" style="font-weight:normal;font-size:12px;"> · 조회 ${esc(
+          from
+        )} ~ ${esc(to)}</span>${esc(adjNote)}`;
+      }
+    } catch (e) {
+      if (apiStatusEl) apiStatusEl.textContent = `API 신규 확인 실패: ${e.message || "오류"}`;
+    }
+  };
+
   qs("#inbound-plan-2-refresh")?.addEventListener("click", () => loadList());
+  qs("#inbound-plan-2-check-new")?.addEventListener("click", () => checkApiNewSlips());
+  qs("#inbound-plan-2-delete-selected")?.addEventListener("click", async () => {
+    const selected = inboundPlan2Items.filter((x) => selectedSlipKeys.has(normalizeSlipNoText(x.poNo)));
+    if (!selected.length) {
+      alert("삭제할 전표를 먼저 체크하세요.");
+      return;
+    }
+    const ok = confirm(`선택한 전표 ${selected.length}건을 삭제할까요?\n(전표별 품목 행 전체가 삭제됩니다.)`);
+    if (!ok) return;
+    try {
+      const res = await api("/api/inbound-plan-upload/delete", {
+        method: "POST",
+        body: JSON.stringify({ slipNos: selected.map((x) => x.poNo) })
+      });
+      inboundPlan2Items = Array.isArray(res.items) ? res.items : [];
+      selectedSlipKeys = new Set();
+      if (metaEl) {
+        const fn = res.sourceFileName ? esc(res.sourceFileName) : "-";
+        const at = res.uploadedAt ? esc(res.uploadedAt.slice(0, 19).replace("T", " ")) : "-";
+        metaEl.innerHTML = `저장된 파일: <strong>${fn}</strong> · 반영 시각: ${at} · 누적 품목 행 <strong>${Number(
+          res.lineCount || 0
+        )}</strong> · 누적 전표 <strong>${res.slipCount ?? inboundPlan2Items.length}</strong>`;
+      }
+      drawTable();
+      await checkApiNewSlips();
+      if (!Number(res.deletedLineCount || 0)) {
+        alert("삭제된 항목이 없습니다. 체크한 발주번호 형식이 저장 데이터와 다른지 확인해 주세요.");
+      } else {
+        alert(`삭제 완료: 전표 ${res.deletedSlipCount ?? selected.length}건, 품목 행 ${res.deletedLineCount ?? 0}줄`);
+      }
+    } catch (e) {
+      alert(e.message || "선택 삭제 실패");
+    }
+  });
   qs("#inbound-plan-2-upload")?.addEventListener("click", async () => {
     const input = qs("#inbound-plan-2-file");
     const file = input?.files?.[0];
@@ -2358,16 +2598,36 @@ async function renderInboundPlan2() {
       if (metaEl) {
         const fn = esc(res.sourceFileName || sourceFileName);
         const at = res.uploadedAt ? esc(res.uploadedAt.slice(0, 19).replace("T", " ")) : "";
-        metaEl.innerHTML = `저장된 파일: <strong>${fn}</strong> · 반영 시각: ${at} · 품목 행 <strong>${Number(res.lineCount || 0)}</strong> · 전표 <strong>${res.slipCount ?? inboundPlan2Items.length}</strong>`;
+        const skip =
+          res.skippedLineCount > 0
+            ? ` · 이번 업로드에서 생략(기존 발주와 동일) 품목 행 <strong>${res.skippedLineCount}</strong> · 해당 전표 수 <strong>${res.skippedExistingSlipCount ?? 0}</strong>`
+            : "";
+        const add =
+          res.addedLineCount != null
+            ? ` · 이번에 추가된 품목 행 <strong>${res.addedLineCount}</strong> · 신규 전표 <strong>${res.newSlipCount ?? 0}</strong>`
+            : "";
+        metaEl.innerHTML = `저장된 파일: <strong>${fn}</strong> · 반영 시각: ${at} · 누적 품목 행 <strong>${Number(res.lineCount || 0)}</strong> · 누적 전표 <strong>${res.slipCount ?? inboundPlan2Items.length}</strong>${add}${skip}`;
       }
       drawTable();
-      alert(`반영 완료: 전표 ${res.slipCount ?? inboundPlan2Items.length}건, 품목 행 ${res.lineCount ?? 0}건`);
+      const skipMsg =
+        res.skippedLineCount > 0
+          ? `\n건너뜀: 동일 발주번호 ${res.skippedExistingSlipCount ?? 0}건(품목 행 ${res.skippedLineCount}줄). 기존 데이터 유지.`
+          : "";
+      const addMsg =
+        res.addedLineCount != null
+          ? `\n추가: 신규 전표 ${res.newSlipCount ?? 0}건, 품목 행 ${res.addedLineCount}줄.`
+          : "";
+      alert(
+        `반영 완료.\n누적 전표 ${res.slipCount ?? inboundPlan2Items.length}건, 누적 품목 행 ${res.lineCount ?? 0}건.${addMsg}${skipMsg}`
+      );
+      await checkApiNewSlips();
     } catch (e) {
       alert(e.message || "업로드 실패");
     }
   });
 
   await loadList();
+  await checkApiNewSlips();
 }
 
 function renderOutbound() {

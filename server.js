@@ -793,6 +793,21 @@ function normalizeInboundPlanRows(rawRows, fallbackDateCompact = "") {
       const remark = String(pickFirstNonEmpty(x, ["REF_DES", "REMARK", "NOTE", "DESC"]));
       const note = String(pickFirstNonEmpty(x, ["MEMO", "BIGO", "NOTE2"]));
       const currency = String(pickFirstNonEmpty(x, ["CODE_DES", "EXCHANGE_TYPE", "FOREIGN_FLAG"]));
+      const lastModifiedAt = String(
+        pickFirstNonEmpty(x, [
+          "MODIFY_DATE",
+          "MODIFIED_DATE",
+          "MOD_DATE",
+          "LAST_MOD_DATE",
+          "LAST_MODIFIED_DATE",
+          "LAST_UPDATE_DATE",
+          "UPDATE_DATE",
+          "UPD_DATE",
+          "CHG_DATE",
+          "EDIT_DATE",
+          "WRITE_DATE"
+        ]) || pickFirstByKeyPattern(x, (k) => /modi|update|upd|chg|edit|수정/i.test(String(k)))
+      );
       const displayPoNo = formatOrderNoByDateAndSeq(poNo, poDate, fallbackDateCompact);
       const detail = buildInboundPlanDetail(x);
       return {
@@ -812,13 +827,23 @@ function normalizeInboundPlanRows(rawRows, fallbackDateCompact = "") {
         remark,
         note,
         currency,
+        lastModifiedAt,
         detail
       };
     });
 }
 
 function normalizeSlipNoText(v) {
-  return String(v || "").trim().replace(/\s+/g, "");
+  const s = String(v || "").trim();
+  if (!s) return "";
+  const compact = s.replace(/\s+/g, "");
+  // Treat 26/04/18-1 and 2026/04/18 -1 as the same slip key.
+  const m = compact.match(/^(\d{2}|\d{4})\/?(\d{2})\/?(\d{2})-(\d+)$/);
+  if (m) {
+    const yy = m[1].length === 4 ? m[1].slice(2) : m[1];
+    return `${yy}/${m[2]}/${m[3]}-${String(Number(m[4]))}`;
+  }
+  return compact;
 }
 
 /** 이카운트 발주서현황 엑셀의 「일자-No.」에서 날짜 부분 → YYYY-MM-DD */
@@ -840,6 +865,29 @@ function numOrEmpty(v) {
   if (v === "" || v === null || v === undefined) return "";
   const n = Number(String(v).replace(/,/g, ""));
   return Number.isFinite(n) ? n : "";
+}
+
+function normalizeDateTimeDigits(v) {
+  const s = String(v || "").trim();
+  if (!s) return "";
+  return s.replace(/[^\d]/g, "");
+}
+
+function pickLatestDateTimeText(values) {
+  const list = Array.isArray(values) ? values : [];
+  let bestText = "";
+  let bestKey = "";
+  for (const raw of list) {
+    const txt = String(raw || "").trim();
+    if (!txt) continue;
+    const key = normalizeDateTimeDigits(txt);
+    if (!key) continue;
+    if (!bestKey || key > bestKey) {
+      bestKey = key;
+      bestText = txt;
+    }
+  }
+  return bestText;
 }
 
 /**
@@ -889,6 +937,7 @@ function parseInboundPlanUploadMatrix(matrix) {
   const iAmt = col("공급가액");
   const iRef = col("적요");
   const iNote = col("비고");
+  const iLastModified = col("최종수정일자", "최종수정일시", "수정일자", "수정일시", "수정일");
   if (iSlip < 0 || iCode < 0) {
     throw new Error("필수 열(일자-No., 품목코드)을 찾지 못했습니다.");
   }
@@ -917,11 +966,53 @@ function parseInboundPlanUploadMatrix(matrix) {
       unitPrice: numOrEmpty(iPrice >= 0 ? row[iPrice] : ""),
       supplyAmount: numOrEmpty(iAmt >= 0 ? row[iAmt] : ""),
       remark: iRef >= 0 ? String(row[iRef] ?? "").trim() : "",
-      note: iNote >= 0 ? String(row[iNote] ?? "").trim() : ""
+      note: iNote >= 0 ? String(row[iNote] ?? "").trim() : "",
+      lastModifiedAt: iLastModified >= 0 ? String(row[iLastModified] ?? "").trim() : ""
     });
   }
   if (!lines.length) throw new Error("데이터 행이 없습니다. 헤더 아래에 품목 행이 있는지 확인하세요.");
   return lines;
+}
+
+/**
+ * 저장소에 이미 있는 발주번호(일자-No. 정규화 키)와 동일한 전표는 파일 쪽 행을 버림.
+ * 없는 발주번호의 품목 행만 기존 lines 뒤에 붙임 — 기존 전표 내용은 덮어쓰지 않음.
+ */
+function mergeInboundPlanUploadByNewSlipsOnly(existingLines, incomingLines) {
+  const existing = Array.isArray(existingLines) ? existingLines : [];
+  const incoming = Array.isArray(incomingLines) ? incomingLines : [];
+  const existingSlipKeys = new Set();
+  for (const row of existing) {
+    const k = normalizeSlipNoText(row.slipNo);
+    if (k) existingSlipKeys.add(k);
+  }
+  const added = [];
+  let skippedLineCount = 0;
+  const skippedSlipKeys = new Set();
+  for (const row of incoming) {
+    const k = normalizeSlipNoText(row.slipNo);
+    if (!k) continue;
+    if (existingSlipKeys.has(k)) {
+      skippedLineCount += 1;
+      skippedSlipKeys.add(k);
+      continue;
+    }
+    added.push(row);
+  }
+  const newSlipKeys = new Set();
+  for (const row of added) {
+    const k = normalizeSlipNoText(row.slipNo);
+    if (k) newSlipKeys.add(k);
+  }
+  const merged = [...existing, ...added];
+  return {
+    merged,
+    addedLineCount: added.length,
+    newSlipCount: newSlipKeys.size,
+    skippedLineCount,
+    skippedExistingSlipCount: skippedSlipKeys.size,
+    skippedSlipKeysSample: Array.from(skippedSlipKeys).slice(0, 40)
+  };
 }
 
 function aggregateInboundPlanUploadLines(lines) {
@@ -950,7 +1041,8 @@ function aggregateInboundPlanUploadLines(lines) {
       dueDate: first.dueDate || "",
       whName: first.whName || "",
       status: "업로드",
-      lineCount: group.length
+      lineCount: group.length,
+      lastModifiedAt: pickLatestDateTimeText(group.map((x) => x.lastModifiedAt))
     });
   }
   items.sort((a, b) => String(a.poNo).localeCompare(String(b.poNo), "ko"));
@@ -979,6 +1071,7 @@ function inboundPlanUploadLinesToDetailRows(lines, slipKeyNorm) {
     unitPrice: x.unitPrice,
     supplyAmount: x.supplyAmount,
     vendorCode: x.vendorCode,
+    lastModifiedAt: x.lastModifiedAt || "",
     detail: []
   }));
 }
@@ -1551,16 +1644,17 @@ async function handleApi(req, res, urlObj) {
 
   /*
    * 입고예정목록 2 — 이카운트 「발주서현황」 엑셀 업로드 → data/db.json inboundPlanUpload
+   * 병합: 이미 저장된 발주번호와 동일한 전표는 건너뛰고, 신규 발주번호 품목 행만 추가(기존 행 덮어쓰기 없음).
    */
   if (req.method === "POST" && pathname === "/api/inbound-plan-upload") {
     try {
       const body = await parseBody(req);
       const sourceFileName = String(body.sourceFileName || "").trim().slice(0, 240);
-      let lines = [];
+      let incoming = [];
       if (Array.isArray(body.lines) && body.lines.length) {
-        lines = body.lines;
+        incoming = body.lines;
       } else if (Array.isArray(body.matrix) && body.matrix.length) {
-        lines = parseInboundPlanUploadMatrix(body.matrix);
+        incoming = parseInboundPlanUploadMatrix(body.matrix);
       } else if (body.sheetBase64 && typeof body.sheetBase64 === "string") {
         const buf = Buffer.from(String(body.sheetBase64).trim(), "base64");
         const wb = XLSX.read(buf, { type: "buffer" });
@@ -1568,20 +1662,35 @@ async function handleApi(req, res, urlObj) {
         if (!name) throw new Error("시트가 없습니다.");
         const ws = wb.Sheets[name];
         const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
-        lines = parseInboundPlanUploadMatrix(matrix);
+        incoming = parseInboundPlanUploadMatrix(matrix);
       } else {
         throw new Error("요청에 matrix(2차원 배열), lines, 또는 sheetBase64가 필요합니다.");
       }
-      if (lines.length > 20000) throw new Error("행 수가 너무 많습니다(최대 20000).");
-      db.inboundPlanUpload.lines = lines;
-      db.inboundPlanUpload.sourceFileName = sourceFileName || "upload.xlsx";
+      if (incoming.length > 20000) throw new Error("파일 품목 행이 너무 많습니다(한 번에 최대 20000).");
+      const existing = db.inboundPlanUpload.lines || [];
+      const {
+        merged,
+        addedLineCount,
+        newSlipCount,
+        skippedLineCount,
+        skippedExistingSlipCount,
+        skippedSlipKeysSample
+      } = mergeInboundPlanUploadByNewSlipsOnly(existing, incoming);
+      if (merged.length > 50000) throw new Error("저장된 총 품목 행이 상한(50000)을 넘습니다. 관리자에게 문의하세요.");
+      db.inboundPlanUpload.lines = merged;
+      db.inboundPlanUpload.sourceFileName = sourceFileName || db.inboundPlanUpload.sourceFileName || "upload.xlsx";
       db.inboundPlanUpload.uploadedAt = new Date().toISOString();
       writeDb(db);
-      const items = aggregateInboundPlanUploadLines(lines);
+      const items = aggregateInboundPlanUploadLines(merged);
       return sendJson(res, 200, {
         ok: true,
-        lineCount: lines.length,
+        lineCount: merged.length,
         slipCount: items.length,
+        addedLineCount,
+        newSlipCount,
+        skippedLineCount,
+        skippedExistingSlipCount,
+        skippedSlipKeysSample,
         items,
         sourceFileName: db.inboundPlanUpload.sourceFileName,
         uploadedAt: db.inboundPlanUpload.uploadedAt
@@ -1600,6 +1709,53 @@ async function handleApi(req, res, urlObj) {
       sourceFileName: db.inboundPlanUpload.sourceFileName || "",
       uploadedAt: db.inboundPlanUpload.uploadedAt || ""
     });
+  }
+
+  const handleInboundPlanUploadDelete = async () => {
+    try {
+      const body = await parseBody(req);
+      const slipNos = Array.isArray(body.slipNos) ? body.slipNos : [];
+      const keys = new Set(
+        slipNos
+          .map((x) => normalizeSlipNoText(x))
+          .filter(Boolean)
+      );
+      if (!keys.size) throw new Error("삭제할 발주번호가 없습니다.");
+      const before = db.inboundPlanUpload.lines || [];
+      const beforeSlipSet = new Set(before.map((row) => normalizeSlipNoText(row.slipNo)).filter(Boolean));
+      const remain = before.filter((row) => !keys.has(normalizeSlipNoText(row.slipNo)));
+      const deletedLineCount = before.length - remain.length;
+      const remainSlipSet = new Set(remain.map((row) => normalizeSlipNoText(row.slipNo)).filter(Boolean));
+      let deletedSlipCount = 0;
+      for (const k of beforeSlipSet) {
+        if (!remainSlipSet.has(k)) deletedSlipCount += 1;
+      }
+      db.inboundPlanUpload.lines = remain;
+      db.inboundPlanUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      const items = aggregateInboundPlanUploadLines(remain);
+      return sendJson(res, 200, {
+        ok: true,
+        deletedSlipCount,
+        deletedLineCount,
+        lineCount: remain.length,
+        slipCount: items.length,
+        items,
+        sourceFileName: db.inboundPlanUpload.sourceFileName || "",
+        uploadedAt: db.inboundPlanUpload.uploadedAt
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  };
+
+  if (req.method === "DELETE" && pathname === "/api/inbound-plan-upload") {
+    return handleInboundPlanUploadDelete();
+  }
+
+  // 일부 환경에서 DELETE body가 누락될 수 있어 POST fallback도 허용
+  if (req.method === "POST" && pathname === "/api/inbound-plan-upload/delete") {
+    return handleInboundPlanUploadDelete();
   }
 
   if (req.method === "GET" && pathname === "/api/inbound-plan-upload/detail") {
