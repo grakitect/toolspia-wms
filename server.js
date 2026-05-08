@@ -52,7 +52,7 @@ function ensureDb() {
     const initial = {
       products: [],
       movements: [],
-      warehouses: ["툴스피아", "다이소", "아세로직스", "가온플러스"],
+      warehouses: ["유통사업부", "다이소", "아세로직스", "가온플러스"],
       partners: {
         inbound: [],
         outbound: [],
@@ -60,19 +60,75 @@ function ensureDb() {
       },
       managers: ["admin"],
       seq: 1,
-      inboundPlanUpload: { lines: [], sourceFileName: "", uploadedAt: "" }
+      inboundSlipConfirmLog: [],
+      inboundPlanUpload: { lines: [], sourceFileName: "", uploadedAt: "", slipWorkflow: {} },
+      outboundOrderUpload: {
+        lines: [],
+        uploadedRows: [],
+        batches: [],
+        appliedBatchByPartner: {},
+        uploadedAt: "",
+        slipWorkflow: {},
+        confirmedLists: {}
+      },
+      outboundCodeMasters: []
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2), "utf-8");
   }
 }
 
+function sleepBusyMs(ms) {
+  const end = Date.now() + Math.max(0, ms);
+  while (Date.now() < end) {
+    /* spin: avoid deps; short waits only */
+  }
+}
+
+function isFsLockLikeError(err) {
+  if (!err) return false;
+  const code = String(err.code || "");
+  if (["EBUSY", "EPERM", "EACCES", "ETXTBSY", "UNKNOWN"].includes(code)) return true;
+  const msg = String(err.message || "");
+  return /EBUSY|EPERM|EACCES|resource busy|another process|사용 중|잠금|locked/i.test(msg);
+}
+
 function readDb() {
   ensureDb();
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const raw = fs.readFileSync(DB_PATH, "utf-8");
+      return JSON.parse(raw);
+    } catch (e) {
+      lastErr = e;
+      if (e instanceof SyntaxError) throw e;
+      if (attempt < 4 && isFsLockLikeError(e)) {
+        sleepBusyMs(35 + attempt * 15);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 function writeDb(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf-8");
+  const payload = JSON.stringify(db, null, 2);
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.writeFileSync(DB_PATH, payload, "utf-8");
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 4 && isFsLockLikeError(e)) {
+        sleepBusyMs(35 + attempt * 15);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 function normalizeDb(db) {
@@ -86,7 +142,7 @@ function normalizeDb(db) {
     db.managers = ["admin"];
   }
   if (!Array.isArray(db.warehouses) || db.warehouses.length === 0) {
-    db.warehouses = ["툴스피아", "다이소", "아세로직스", "가온플러스"];
+    db.warehouses = ["유통사업부", "다이소", "아세로직스", "가온플러스"];
   }
   if (!db.productOptions || typeof db.productOptions !== "object") db.productOptions = {};
   for (const k of PRODUCT_OPTION_KEYS) {
@@ -118,12 +174,42 @@ function normalizeDb(db) {
     db.productOptions[k] = normalizeOptionValues(db.productOptions[k]);
   }
   for (const m of db.movements) {
-    if (!m.warehouse) m.warehouse = "툴스피아";
+    if (!m.warehouse) m.warehouse = "유통사업부";
   }
   if (!db.inboundPlanUpload || typeof db.inboundPlanUpload !== "object") {
-    db.inboundPlanUpload = { lines: [], sourceFileName: "", uploadedAt: "" };
+    db.inboundPlanUpload = { lines: [], sourceFileName: "", uploadedAt: "", slipWorkflow: {} };
   }
   if (!Array.isArray(db.inboundPlanUpload.lines)) db.inboundPlanUpload.lines = [];
+  if (!db.inboundPlanUpload.slipWorkflow || typeof db.inboundPlanUpload.slipWorkflow !== "object") {
+    db.inboundPlanUpload.slipWorkflow = {};
+  }
+  if (!Array.isArray(db.inboundSlipConfirmLog)) db.inboundSlipConfirmLog = [];
+  if (!db.outboundOrderUpload || typeof db.outboundOrderUpload !== "object") {
+    db.outboundOrderUpload = {
+      lines: [],
+      uploadedRows: [],
+      batches: [],
+      appliedBatchByPartner: {},
+      uploadedAt: "",
+      slipWorkflow: {}
+    };
+  }
+  if (!Array.isArray(db.outboundOrderUpload.lines)) db.outboundOrderUpload.lines = [];
+  if (!Array.isArray(db.outboundOrderUpload.uploadedRows)) {
+    // migrate legacy data: old versions stored all uploaded rows in lines
+    db.outboundOrderUpload.uploadedRows = [...db.outboundOrderUpload.lines];
+  }
+  if (!Array.isArray(db.outboundOrderUpload.batches)) db.outboundOrderUpload.batches = [];
+  if (!db.outboundOrderUpload.appliedBatchByPartner || typeof db.outboundOrderUpload.appliedBatchByPartner !== "object") {
+    db.outboundOrderUpload.appliedBatchByPartner = {};
+  }
+  if (!db.outboundOrderUpload.slipWorkflow || typeof db.outboundOrderUpload.slipWorkflow !== "object") {
+    db.outboundOrderUpload.slipWorkflow = {};
+  }
+  if (!db.outboundOrderUpload.confirmedLists || typeof db.outboundOrderUpload.confirmedLists !== "object") {
+    db.outboundOrderUpload.confirmedLists = {};
+  }
+  if (!Array.isArray(db.outboundCodeMasters)) db.outboundCodeMasters = [];
 }
 
 function sendJson(res, code, payload) {
@@ -137,6 +223,38 @@ function toTagList(value) {
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+/** 엑셀·입력창 흔한 공백( NBSP ) 정리 */
+function normalizeInputLoose(s) {
+  return String(s || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 기본정보에 등록된 창고명과 맞춤(표기만 다른 경우) */
+function resolveRegisteredWarehouse(db, raw) {
+  const key = normalizeInputLoose(raw);
+  if (!key) return "";
+  const list = db.warehouses || [];
+  if (list.includes(key)) return key;
+  const hit = list.find((w) => normalizeInputLoose(w) === key);
+  return hit || "";
+}
+
+/** 일괄입고 등: 품목코드·이카운트코드·바코드(SKU)·중포바코드로 상품 탐색 후 대표 code 사용 */
+function findProductByMovementImportCode(db, raw) {
+  const pc = normalizeInputLoose(raw);
+  if (!pc) return null;
+  const list = db.products || [];
+  return (
+    list.find((p) => normalizeInputLoose(p.code) === pc) ||
+    list.find((p) => normalizeInputLoose(p.ecountCode) === pc) ||
+    list.find((p) => normalizeInputLoose(p.barcode) === pc) ||
+    list.find((p) => normalizeInputLoose(p.middleBarcode) === pc) ||
+    null
+  );
 }
 
 function normalizeOptionValues(value) {
@@ -285,29 +403,36 @@ function addMovement(db, row) {
   if (!["IN", "OUT", "ADJUST", "TRANSFER"].includes(type)) {
     throw new Error("유효하지 않은 구분입니다.");
   }
-  const productCode = String(row.productCode || "").trim();
+  const productCodeInput = normalizeInputLoose(row.productCode);
   const qtyRaw = Number(row.qty);
-  const warehouse = String(row.warehouse || "").trim();
-  const toWarehouse = String(row.toWarehouse || "").trim();
-  if (!productCode) throw new Error("상품코드는 필수입니다.");
+  const warehouseRaw = normalizeInputLoose(row.warehouse);
+  const toWarehouseRaw = normalizeInputLoose(row.toWarehouse);
+  if (!productCodeInput) throw new Error("상품코드는 필수입니다.");
   if (!Number.isFinite(qtyRaw) || qtyRaw === 0) {
     throw new Error("수량은 0이 아닌 숫자여야 합니다.");
   }
-  if (!warehouse) throw new Error("창고는 필수입니다.");
-  if (!db.warehouses.includes(warehouse)) throw new Error(`등록되지 않은 창고: ${warehouse}`);
+  const warehouse = resolveRegisteredWarehouse(db, warehouseRaw);
+  if (!warehouse) throw new Error(`등록되지 않은 창고: ${warehouseRaw || "-"}`);
+  let toWarehouse = "";
   if (type === "TRANSFER") {
-    if (!toWarehouse) throw new Error("이동 대상 창고는 필수입니다.");
-    if (!db.warehouses.includes(toWarehouse)) throw new Error(`등록되지 않은 창고: ${toWarehouse}`);
+    toWarehouse = resolveRegisteredWarehouse(db, toWarehouseRaw);
+    if (!toWarehouse) throw new Error(`등록되지 않은 창고: ${toWarehouseRaw || "-"}`);
     if (warehouse === toWarehouse) throw new Error("출발/도착 창고가 동일합니다.");
   }
-  const product = db.products.find((p) => p.code === productCode);
+  const product = findProductByMovementImportCode(db, productCodeInput);
   if (!product) {
-    throw new Error(`등록되지 않은 상품코드: ${productCode}`);
+    throw new Error(
+      `등록되지 않은 상품입니다(품목코드·이카운트코드·바코드(SKU)·중포바코드로 조회): ${productCodeInput}`
+    );
   }
+  const productCode = normalizeInputLoose(product.code);
+  if (!productCode) throw new Error("상품의 품목코드(code)가 비어 있습니다.");
   const usedWarehouses = toTagList(product.usedWarehouses);
   if (usedWarehouses.length) {
     if (!usedWarehouses.includes(warehouse)) {
-      throw new Error(`해당 상품은 지정된 사용창고에서만 처리할 수 있습니다: ${usedWarehouses.join(", ")}`);
+      throw new Error(
+        `해당 상품은 지정된 사용창고에서만 처리할 수 있습니다: ${usedWarehouses.join(", ")} (요청 창고: ${warehouse}, 품목: ${productCode} ${product.name || ""})`
+      );
     }
     if (type === "TRANSFER" && !usedWarehouses.includes(toWarehouse)) {
       throw new Error(`이동 대상 창고가 사용창고에 없습니다: ${usedWarehouses.join(", ")}`);
@@ -337,6 +462,7 @@ function addMovement(db, row) {
     toWarehouse: type === "TRANSFER" ? toWarehouse : "",
     partner: String(row.partner || ""),
     memo: String(row.memo || ""),
+    slipNo: String(row.slipNo || "").trim(),
     user,
     cancelled: false,
     createdAt: row.createdAt || new Date().toISOString()
@@ -357,7 +483,7 @@ function cancelMovement(db, id, user) {
     type: "CANCEL",
     productCode: target.productCode,
     qty: -Number(target.qty || 0),
-    warehouse: target.warehouse || "툴스피아",
+    warehouse: target.warehouse || "유통사업부",
     toWarehouse: target.toWarehouse || "",
     partner: target.partner,
     memo: `원거래 ${target.id} 취소`,
@@ -383,7 +509,7 @@ function computeStockAfterEachMovement(db) {
   });
   const afterMap = {};
   for (const m of sorted) {
-    const from = m.warehouse || "툴스피아";
+    const from = m.warehouse || "유통사업부";
     if (!stockMap[from]) stockMap[from] = {};
     if (!(m.productCode in stockMap[from])) stockMap[from][m.productCode] = 0;
     if (m.type === "TRANSFER") {
@@ -451,11 +577,17 @@ function clampDateRangeToMax30Days(fromCompact, toCompact) {
 
 function extractSessionId(payload) {
   if (!payload || typeof payload !== "object") return "";
+  const datasNested =
+    payload.Data &&
+    payload.Data.Datas &&
+    typeof payload.Data.Datas === "object" &&
+    (payload.Data.Datas.SESSION_ID || payload.Data.Datas.session_id || payload.Data.Datas.sessionId);
   const direct =
     payload.SESSION_ID ||
     payload.session_id ||
     payload.sessionId ||
-    (payload.Data && (payload.Data.SESSION_ID || payload.Data.session_id || payload.Data.sessionId));
+    (payload.Data && (payload.Data.SESSION_ID || payload.Data.session_id || payload.Data.sessionId)) ||
+    datasNested;
   if (direct) return String(direct);
 
   // Fallback: recursive search for possible session fields.
@@ -846,6 +978,1109 @@ function normalizeSlipNoText(v) {
   return compact;
 }
 
+function ymdOrCompactForPurchasesSave(v) {
+  const c = normalizeDateCompact(v);
+  if (c) return c;
+  const s = String(v || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s.replace(/-/g, "");
+  return "";
+}
+
+/**
+ * 발주 조회로 모은 헤더·품목행 → SavePurchases PurchasesList (1품목 = 1건).
+ * opts: { ioDate, custCd, whCd } — 헤더에 코드가 없을 때 테스트용으로 덮어쓰기 가능.
+ */
+function buildSavePurchasesPayloadFromOrder(headerRaw, matchedLines, opts = {}) {
+  const lines = Array.isArray(matchedLines) ? matchedLines : [];
+  const hdr = headerRaw && typeof headerRaw === "object" ? headerRaw : {};
+  const ioDate =
+    ymdOrCompactForPurchasesSave(opts.ioDate) ||
+    ymdOrCompactForPurchasesSave(pickFirstNonEmpty(hdr, ["ORD_DATE", "IO_DATE", "WRITE_DATE"])) ||
+    ymdOrCompactForPurchasesSave(lines[0]?.poDate) ||
+    normalizeDateCompact(new Date().toISOString().slice(0, 10));
+
+  const cust = String(opts.custCd || pickFirstNonEmpty(hdr, ["CUST", "CUST_CD"]) || "").trim();
+  const custDes = String(pickFirstNonEmpty(hdr, ["CUST_DES", "CUST_NM"]) || "").trim();
+  const whCd = String(opts.whCd || pickFirstNonEmpty(hdr, ["WH_CD"]) || "").trim();
+  const ordNo = String(pickFirstNonEmpty(hdr, ["ORD_NO"]) || "").trim();
+  const ordDate = ymdOrCompactForPurchasesSave(pickFirstNonEmpty(hdr, ["ORD_DATE"]));
+  const empCd = String(pickFirstNonEmpty(hdr, ["EMP_CD", "CUST_NAME", "WRITER_ID"]) || "").trim();
+
+  const usable = lines.filter((x) => String(x.itemCode || "").trim() && String(x.qty ?? "").trim() !== "");
+  if (!usable.length) {
+    throw new Error(
+      "구매입력용 품목 라인이 없습니다(품목코드·수량). 발주 상세에서 품목 행이 열리는지 확인하거나 .env의 ECOUNT_INBOUND_LINE_API_PATHS 등을 설정하세요."
+    );
+  }
+  if (!cust) throw new Error("거래처코드(CUST)를 찾지 못했습니다. 발주 헤더에 없으면 요청 본문에 custCd로 넘기세요.");
+  if (!whCd) throw new Error("창고코드(WH_CD)를 찾지 못했습니다. 발주 헤더에 없으면 요청 본문에 whCd로 넘기세요.");
+
+  const PurchasesList = usable.map((line) => {
+    const qty = String(line.qty ?? "")
+      .replace(/,/g, "")
+      .trim();
+    const timeDate = ymdOrCompactForPurchasesSave(line.dueDate);
+    const bulk = {
+      IO_DATE: ioDate,
+      CUST: cust,
+      CUST_DES: custDes,
+      WH_CD: whCd,
+      PROD_CD: String(line.itemCode || "").trim(),
+      PROD_DES: String(line.itemName || "").trim(),
+      QTY: qty
+    };
+    if (ordNo) bulk.ORD_NO = ordNo;
+    if (ordDate) bulk.ORD_DATE = ordDate;
+    if (empCd) bulk.EMP_CD = empCd;
+    if (timeDate) bulk.TIME_DATE = timeDate;
+    const ref = String(line.remark || "").trim();
+    if (ref) bulk.REF_DES = ref;
+    const memo = String(line.note || "").trim();
+    if (memo) bulk.MEMO = memo;
+    return { BulkDatas: bulk };
+  });
+
+  return { PurchasesList };
+}
+
+/** 업로드 전표 품목 행(품목코드 순) — 수량·구매입력과 동일 순서 유지 */
+function getUploadSlipLineGroupSorted(lines, slipKeyNorm) {
+  const group = (Array.isArray(lines) ? lines : []).filter((x) => normalizeSlipNoText(x.slipNo) === slipKeyNorm);
+  group.sort((a, b) => String(a.itemCode).localeCompare(String(b.itemCode)));
+  return group;
+}
+
+function mergeLineQtyByIndexFromBody(bodyMap, group) {
+  const out = {};
+  for (let i = 0; i < group.length; i++) {
+    const raw =
+      bodyMap && bodyMap[String(i)] !== undefined && bodyMap[String(i)] !== null && String(bodyMap[String(i)]).trim() !== ""
+        ? Number(String(bodyMap[String(i)]).replace(/,/g, ""))
+        : Number(String(group[i].qty ?? "").replace(/,/g, "")) || 0;
+    out[String(i)] = raw;
+  }
+  return out;
+}
+
+const OUTBOUND_PARTNER_ADAPTERS = {
+  daiso: {
+    parserVersion: "daiso-v1",
+    alias: {
+      orderNo: ["발주번호", "주문번호", "orderNo", "ORDER_NO"],
+      orderDate: ["주문일자", "발주일자", "orderDate"],
+      dueDate: ["납기일", "출고예정일", "dueDate"],
+      productCode: ["상품코드", "품번", "SKU", "productCode"],
+      productName: ["상품명", "품명", "productName"],
+      orderQty: ["주문수량", "수량", "orderQty"],
+      warehouse: ["창고", "출고창고", "warehouse"],
+      remark: ["비고", "메모", "remark"]
+    }
+  },
+  emart: {
+    parserVersion: "emart-v1",
+    alias: {
+      orderNo: ["주문번호", "발주번호", "OrderNo"],
+      orderDate: ["주문일", "발주일", "OrderDate"],
+      storeInDate: ["점입점일자"],
+      poDate: ["발주일자"],
+      storeName: ["점포명"],
+      dueDate: ["납품요청일", "출고일", "DueDate"],
+      productCode: ["품목코드", "SKU", "상품코드", "ProductCode"],
+      productName: ["품목명", "상품명", "ProductName"],
+      barcode: ["바코드", "Barcode", "BARCODE"],
+      orderUnit: ["발주단위"],
+      lot: ["LOT"],
+      orderQty: ["수량", "요청수량", "주문수량", "Qty"],
+      unshipStatus: ["미출상태"],
+      fixedQty: ["확정수량"],
+      orderAmount: ["발주금액"],
+      unitPrice: ["발주원가", "단가", "주문단가", "판매단가", "UnitPrice", "PRICE"],
+      supplyAmt: ["공급가액", "공급가", "SupplyAmt", "SUPPLY_AMT"],
+      vatAmt: ["부가세", "부가세액", "VatAmt", "VAT_AMT"],
+      totalAmt: ["합계", "총액", "TotalAmt", "TOTAL_AMT"],
+      centerInDate: ["센터입하일자"],
+      centerCode: ["센터코드"],
+      centerName: ["센터이름", "센터명", "센터"],
+      warehouse: ["출고창고", "센터", "센터명", "warehouse"],
+      remark: ["메모", "비고", "Remark"]
+    }
+  },
+  lotte: {
+    parserVersion: "lotte-v1",
+    alias: {
+      orderNo: ["발주No", "주문번호", "OrderNo"],
+      orderDate: ["발주일자", "주문일", "OrderDate"],
+      dueDate: ["납기일자", "요청출고일", "DueDate"],
+      productCode: ["상품코드", "품목코드", "SKU"],
+      productName: ["상품명", "품목명"],
+      orderQty: ["주문수량", "지시수량", "Qty"],
+      warehouse: ["창고", "출고창고"],
+      remark: ["비고", "메모"]
+    }
+  }
+};
+
+const OUTBOUND_PARTNER_TEMPLATE_HEADERS = {
+  daiso: ["발주번호", "주문일자", "납기일", "상품코드", "상품명", "주문수량", "창고", "비고"],
+  emart: ["주문번호", "주문일", "납품요청일", "품목코드", "품목명", "요청수량", "출고창고", "메모"],
+  lotte: ["발주No", "발주일자", "납기일자", "상품코드", "상품명", "주문수량", "창고", "비고"]
+};
+
+function normalizeOutboundPartnerType(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (["daiso", "emart", "lotte"].includes(s)) return s;
+  return "";
+}
+
+function partnerLabelFromType(t) {
+  if (t === "daiso") return "다이소";
+  if (t === "emart") return "이마트";
+  if (t === "lotte") return "롯데마트";
+  return "";
+}
+
+function getOutboundCodeMasterMap(db, partnerType) {
+  const map = new Map();
+  for (const row of db.outboundCodeMasters || []) {
+    if (!row || row.partnerType !== partnerType) continue;
+    const src = String(row.sourceCode || "").trim();
+    const dst = String(row.ecountCode || "").trim();
+    if (!src || !dst) continue;
+    map.set(src, dst);
+    const loose = normalizeInputLoose(src);
+    if (loose) map.set(loose, dst);
+    const numLike = src.replace(/,/g, "").trim();
+    if (/^\d+\.0+$/.test(numLike)) map.set(numLike.replace(/\.0+$/, ""), dst);
+  }
+  return map;
+}
+
+function parseOutboundCodeMasterRows(matrix, partnerType, sourceFileName) {
+  const rows = Array.isArray(matrix) ? matrix : [];
+  if (!rows.length) return { items: [], errorRows: [] };
+  const headerRow = detectHeaderRowIndex(
+    rows,
+    [
+      ["바코드", "상품코드", "원본코드", "sourceCode", "SOURCE_CODE"],
+      ["이카운트코드", "이카운트품목코드", "품목코드", "ecountCode", "ECOUNT_CODE"]
+    ],
+    30
+  );
+  const headers = rows[headerRow] || [];
+  const iSrc = findHeaderIndexByAliases(headers, ["바코드", "상품코드", "원본코드", "sourceCode", "SOURCE_CODE"]);
+  const iDst = findHeaderIndexByAliases(headers, ["이카운트코드", "이카운트품목코드", "품목코드", "ecountCode", "ECOUNT_CODE"]);
+  let iName = findHeaderIndexByAliases(headers, [
+    "품명 및 규격(이카운트)",
+    "품명및규격(이카운트)",
+    "품목명(이카운트)",
+    "상품명(이카운트)",
+    "품목명",
+    "상품명",
+    "name"
+  ]);
+  if (iName < 0) {
+    const h = headers.map((x) => String(x || "").trim());
+    iName = h.findIndex((x) => x.includes("품명") || x.includes("상품명"));
+  }
+  if (iSrc < 0 || iDst < 0) throw new Error("코드 마스터 필수 열(바코드/상품코드, 이카운트코드)을 찾지 못했습니다.");
+  const items = [];
+  const errorRows = [];
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const src = String(row[iSrc] ?? "").trim();
+    const dst = String(row[iDst] ?? "").trim();
+    const name = iName >= 0 ? String(row[iName] ?? "").trim() : "";
+    if (!src && !dst) continue;
+    if (!src || !dst) {
+      errorRows.push({ sourceRowNo: r + 1, reason: "원본코드/이카운트코드 누락", raw: row });
+      continue;
+    }
+    items.push({
+      partnerType,
+      sourceCode: src,
+      ecountCode: dst,
+      name,
+      sourceFileName: sourceFileName || "",
+      updatedAt: new Date().toISOString()
+    });
+  }
+  return { items, errorRows };
+}
+
+function findHeaderIndexByAliases(headers, aliases) {
+  const hRaw = (Array.isArray(headers) ? headers : []).map((x) => String(x || "").trim().toLowerCase());
+  const hNorm = hRaw.map((x) => normalizeHeaderKey(x));
+  for (const alias of aliases || []) {
+    const aRaw = String(alias || "").trim().toLowerCase();
+    const aNorm = normalizeHeaderKey(aRaw);
+    let i = hRaw.findIndex((x) => x === aRaw);
+    if (i >= 0) return i;
+    i = hNorm.findIndex((x) => x === aNorm);
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+function detectHeaderRowIndex(rows, requiredAliasGroups, maxScanRows = 20) {
+  const scanMax = Math.min(Array.isArray(rows) ? rows.length : 0, maxScanRows);
+  for (let r = 0; r < scanMax; r++) {
+    const headers = rows[r] || [];
+    const ok = requiredAliasGroups.every((aliases) => findHeaderIndexByAliases(headers, aliases) >= 0);
+    if (ok) return r;
+  }
+  return 0;
+}
+
+function normalizeHeaderKey(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\-_().[\]{}]/g, "");
+}
+
+function parseOutboundOrderRowsByPartner(matrix, partnerType, uploadBatchId, sourceFileName, db) {
+  const cfg = OUTBOUND_PARTNER_ADAPTERS[partnerType];
+  if (!cfg) throw new Error("지원하지 않는 판매처 타입입니다.");
+  const rows = Array.isArray(matrix) ? matrix : [];
+  if (!rows.length) return { okRows: [], errorRows: [] };
+  const requiredAliasGroups =
+    partnerType === "emart"
+      ? [cfg.alias.productCode, cfg.alias.orderQty, [...(cfg.alias.orderNo || []), ...(cfg.alias.poDate || [])]]
+      : [cfg.alias.orderNo, cfg.alias.productCode, cfg.alias.orderQty];
+  const headerRow = detectHeaderRowIndex(rows, requiredAliasGroups, 30);
+  const headers = rows[headerRow] || [];
+  const idx = {
+    orderNo: findHeaderIndexByAliases(headers, cfg.alias.orderNo),
+    orderDate: findHeaderIndexByAliases(headers, cfg.alias.orderDate),
+    storeInDate: findHeaderIndexByAliases(headers, cfg.alias.storeInDate || []),
+    poDate: findHeaderIndexByAliases(headers, cfg.alias.poDate || []),
+    storeName: findHeaderIndexByAliases(headers, cfg.alias.storeName || []),
+    dueDate: findHeaderIndexByAliases(headers, cfg.alias.dueDate),
+    productCode: findHeaderIndexByAliases(headers, cfg.alias.productCode),
+    productName: findHeaderIndexByAliases(headers, cfg.alias.productName),
+    barcode: findHeaderIndexByAliases(headers, cfg.alias.barcode || []),
+    orderUnit: findHeaderIndexByAliases(headers, cfg.alias.orderUnit || []),
+    lot: findHeaderIndexByAliases(headers, cfg.alias.lot || []),
+    orderQty: findHeaderIndexByAliases(headers, cfg.alias.orderQty),
+    unshipStatus: findHeaderIndexByAliases(headers, cfg.alias.unshipStatus || []),
+    fixedQty: findHeaderIndexByAliases(headers, cfg.alias.fixedQty || []),
+    orderAmount: findHeaderIndexByAliases(headers, cfg.alias.orderAmount || []),
+    unitPrice: findHeaderIndexByAliases(headers, cfg.alias.unitPrice || []),
+    supplyAmt: findHeaderIndexByAliases(headers, cfg.alias.supplyAmt || []),
+    vatAmt: findHeaderIndexByAliases(headers, cfg.alias.vatAmt || []),
+    totalAmt: findHeaderIndexByAliases(headers, cfg.alias.totalAmt || []),
+    centerInDate: findHeaderIndexByAliases(headers, cfg.alias.centerInDate || []),
+    centerCode: findHeaderIndexByAliases(headers, cfg.alias.centerCode || []),
+    centerName: findHeaderIndexByAliases(headers, cfg.alias.centerName || []),
+    warehouse: findHeaderIndexByAliases(headers, cfg.alias.warehouse),
+    remark: findHeaderIndexByAliases(headers, cfg.alias.remark)
+  };
+  if ((partnerType !== "emart" && idx.orderNo < 0) || idx.productCode < 0 || idx.orderQty < 0) {
+    throw new Error("필수 열(주문번호 또는 발주일자, 상품코드, 주문수량)을 찾지 못했습니다.");
+  }
+  const okRows = [];
+  const errorRows = [];
+  const partner = partnerLabelFromType(partnerType);
+  const masterMap = getOutboundCodeMasterMap(db || {}, partnerType);
+  const startRow = headerRow + 1;
+  for (let r = startRow; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const orderNoRaw = idx.orderNo >= 0 ? String(row[idx.orderNo] ?? "").trim() : "";
+    const poDate = idx.poDate >= 0 ? String(row[idx.poDate] ?? "").trim() : "";
+    const storeInDate = idx.storeInDate >= 0 ? String(row[idx.storeInDate] ?? "").trim() : "";
+    const centerCode = idx.centerCode >= 0 ? String(row[idx.centerCode] ?? "").trim() : "";
+    const storeName = idx.storeName >= 0 ? String(row[idx.storeName] ?? "").trim() : "";
+    const autoOrderNoBase = [poDate || storeInDate, centerCode, storeName].filter(Boolean).join("-");
+    const orderNo = orderNoRaw || (partnerType === "emart" ? autoOrderNoBase || `${uploadBatchId}-${r + 1}` : "");
+    const productCodeRaw = String(row[idx.productCode] ?? "").trim();
+    const productCodeLoose = normalizeInputLoose(productCodeRaw);
+    const productCodeNum = productCodeRaw.replace(/,/g, "").trim().replace(/\.0+$/, "");
+    const productCodeMapped =
+      masterMap.get(productCodeRaw) || masterMap.get(productCodeLoose) || masterMap.get(productCodeNum) || "";
+    const productCode = productCodeMapped || productCodeRaw;
+    const orderQty = Number(String(row[idx.orderQty] ?? "").replace(/,/g, "").trim());
+    if (!orderNo && !productCodeRaw) continue;
+    if (!orderNo || !productCodeRaw || !Number.isFinite(orderQty) || orderQty <= 0) {
+      errorRows.push({ sourceRowNo: r + 1, reason: "필수값 누락/수량 오류", raw: row });
+      continue;
+    }
+    const slipNo = `${partnerType.toUpperCase()}-${orderNo}`;
+    okRows.push({
+      partnerType,
+      partner,
+      partnerCode: partnerType.toUpperCase(),
+      parserVersion: cfg.parserVersion,
+      uploadBatchId,
+      sourceFileName: sourceFileName || "",
+      sourceRowNo: r + 1,
+      rawSnapshot: JSON.stringify(row).slice(0, 1000),
+      orderNo,
+      slipNo,
+      orderDate: idx.orderDate >= 0 ? String(row[idx.orderDate] ?? "").trim() : poDate || storeInDate,
+      dueDate: idx.dueDate >= 0 ? String(row[idx.dueDate] ?? "").trim() : "",
+      productCode,
+      sourceProductCode: productCodeRaw,
+      mappedProductCode: productCodeMapped,
+      productName: idx.productName >= 0 ? String(row[idx.productName] ?? "").trim() : "",
+      barcode: idx.barcode >= 0 ? String(row[idx.barcode] ?? "").trim() : "",
+      orderQty: Math.round(orderQty),
+      orderUnit: idx.orderUnit >= 0 ? String(row[idx.orderUnit] ?? "").trim() : "",
+      lot: idx.lot >= 0 ? String(row[idx.lot] ?? "").trim() : "",
+      unshipStatus: idx.unshipStatus >= 0 ? String(row[idx.unshipStatus] ?? "").trim() : "",
+      fixedQty: idx.fixedQty >= 0 ? String(row[idx.fixedQty] ?? "").trim() : "",
+      orderAmount: idx.orderAmount >= 0 ? String(row[idx.orderAmount] ?? "").trim() : "",
+      unitPrice: idx.unitPrice >= 0 ? String(row[idx.unitPrice] ?? "").trim() : "",
+      supplyAmt: idx.supplyAmt >= 0 ? String(row[idx.supplyAmt] ?? "").trim() : "",
+      vatAmt: idx.vatAmt >= 0 ? String(row[idx.vatAmt] ?? "").trim() : "",
+      totalAmt: idx.totalAmt >= 0 ? String(row[idx.totalAmt] ?? "").trim() : "",
+      centerInDate: idx.centerInDate >= 0 ? String(row[idx.centerInDate] ?? "").trim() : "",
+      centerCode: idx.centerCode >= 0 ? String(row[idx.centerCode] ?? "").trim() : "",
+      centerName:
+        idx.centerName >= 0
+          ? String(row[idx.centerName] ?? "").trim()
+          : idx.warehouse >= 0
+            ? String(row[idx.warehouse] ?? "").trim()
+            : "",
+      storeInDate: storeInDate,
+      poDate: poDate,
+      storeName: storeName,
+      remark: idx.remark >= 0 ? String(row[idx.remark] ?? "").trim() : "",
+      warehouse: idx.warehouse >= 0 ? String(row[idx.warehouse] ?? "").trim() : ""
+    });
+  }
+  return { okRows, errorRows };
+}
+
+function aggregateOutboundUploadSlips(lines, slipWorkflow, partnerTypeFilter) {
+  const arr = Array.isArray(lines) ? lines : [];
+  const wf = slipWorkflow && typeof slipWorkflow === "object" ? slipWorkflow : {};
+  const by = new Map();
+  for (const x of arr) {
+    if (partnerTypeFilter && x.partnerType !== partnerTypeFilter) continue;
+    const k = normalizeSlipNoText(x.slipNo);
+    if (!k) continue;
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(x);
+  }
+  const items = [];
+  for (const [k, group] of by) {
+    const first = group[0];
+    const w = wf[k] || {};
+    const qMap = w.lineQtyByIndex && typeof w.lineQtyByIndex === "object" ? w.lineQtyByIndex : {};
+    const totalOrderQty = group.reduce((s, x) => s + (Number(x.orderQty) || 0), 0);
+    const totalConfirmQty = group.reduce((s, x, i) => {
+      const q = qMap[String(i)] != null ? Number(qMap[String(i)]) : Number(x.orderQty) || 0;
+      return s + (Number.isFinite(q) ? q : 0);
+    }, 0);
+    items.push({
+      slipNo: first.slipNo,
+      orderNo: first.orderNo,
+      partnerType: first.partnerType,
+      partner: first.partner,
+      orderDate: first.orderDate,
+      dueDate: first.dueDate,
+      lineCount: group.length,
+      totalOrderQty,
+      totalConfirmQty,
+      status: w.status || "draft",
+      confirmedAt: w.confirmedAt || null,
+      sentAt: w.sentAt || null
+    });
+  }
+  items.sort((a, b) => String(b.orderDate || "").localeCompare(String(a.orderDate || "")));
+  return items;
+}
+
+function outboundUploadLinesToDetailRows(lines, slipKeyNorm) {
+  const group = (Array.isArray(lines) ? lines : []).filter((x) => normalizeSlipNoText(x.slipNo) === slipKeyNorm);
+  group.sort((a, b) => String(a.productCode || "").localeCompare(String(b.productCode || ""), "ko"));
+  return group;
+}
+
+/** 출고확정 취소: 확정 시 기록된 수량만큼 ADJUST로 재고 원복 후 전표를 초안으로 되돌림 */
+function performOutboundWorkflowReopen(db, slipNoInput) {
+  const slipDisp = String(slipNoInput || "").trim();
+  const key = normalizeSlipNoText(slipNoInput);
+  const group = outboundUploadLinesToDetailRows(db.outboundOrderUpload.lines || [], key);
+  if (!group.length) throw new Error(`해당 전표의 품목 행이 없습니다: ${slipDisp || key}`);
+  const wfPrev = db.outboundOrderUpload.slipWorkflow[key] || { status: "draft", lineQtyByIndex: {} };
+  if (wfPrev.sentAt) throw new Error("이카운트 전송 완료 전표는 확정취소할 수 없습니다.");
+  if (wfPrev.status !== "confirmed") throw new Error("출고확정된 전표만 확정취소할 수 있습니다.");
+  const memoSlip = String(group[0]?.slipNo || slipDisp || key).trim();
+  const stockUser = String(db.managers[0] || "");
+  if (!stockUser) throw new Error("등록된 담당자가 없어 재고 원복을 처리할 수 없습니다.");
+  for (let i = 0; i < group.length; i++) {
+    const qty = Number((wfPrev.lineQtyByIndex || {})[String(i)] ?? group[i].orderQty);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    addMovement(db, {
+      type: "ADJUST",
+      productCode: group[i].productCode,
+      qty: Math.abs(qty),
+      warehouse: String(group[i].warehouse || "").trim() || String(process.env.WMS_DEFAULT_OUTBOUND_WH || "").trim() || "유통사업부",
+      partner: "",
+      memo: `출고확정 취소 원복 ${memoSlip}`,
+      slipNo: memoSlip,
+      user: stockUser
+    });
+  }
+  db.outboundOrderUpload.slipWorkflow[key] = { ...wfPrev, status: "draft", confirmedAt: undefined };
+}
+
+function computeOutboundConfirmQMerged(group, bodyLineQtyByIndex) {
+  const bodyLineQtyByIndexSafe = bodyLineQtyByIndex && typeof bodyLineQtyByIndex === "object" ? bodyLineQtyByIndex : {};
+  const hasBodyLineQtyByIndex = Object.keys(bodyLineQtyByIndexSafe).length > 0;
+  if (hasBodyLineQtyByIndex) {
+    return mergeLineQtyByIndexFromBody(bodyLineQtyByIndexSafe, group.map((x) => ({ qty: x.orderQty })));
+  }
+  const out = {};
+  for (let i = 0; i < group.length; i++) {
+    const fixedRaw = group[i]?.fixedQty;
+    const fixed =
+      fixedRaw != null && String(fixedRaw).trim() !== ""
+        ? Number(String(fixedRaw).replace(/,/g, ""))
+        : Number(group[i]?.orderQty || 0);
+    const unship = String(group[i]?.unshipStatus || "").trim() === "미출";
+    const qty = unship ? 0 : Number.isFinite(fixed) ? Math.max(0, Math.trunc(fixed)) : 0;
+    out[String(i)] = qty;
+  }
+  return out;
+}
+
+/** 단건 출고확정(전표 상세·일괄 API 공통). db 객체를 직접 수정한다. */
+function applyOutboundWorkflowConfirm(db, slipNoInput, stockUserInput, bodyLineQtyByIndexOpt) {
+  const slipNo = String(slipNoInput || "").trim();
+  const key = normalizeSlipNoText(slipNo);
+  const group = outboundUploadLinesToDetailRows(db.outboundOrderUpload.lines || [], key);
+  if (!group.length) throw new Error(`해당 전표의 품목 행이 없습니다: ${slipNo}`);
+  const wfPrev = db.outboundOrderUpload.slipWorkflow[key] || { status: "draft", lineQtyByIndex: {} };
+  const qMerged = computeOutboundConfirmQMerged(group, bodyLineQtyByIndexOpt);
+
+  if (wfPrev.status === "confirmed") throw new Error("이미 출고확정된 전표입니다.");
+  if (wfPrev.sentAt) throw new Error("이카운트 전송 완료 전표는 확정취소 후 다시 처리하세요.");
+  const stockUser =
+    String(stockUserInput || "").trim() || String(group[0].manager || "").trim() || String(db.managers[0] || "");
+  if (!db.managers.includes(stockUser)) throw new Error("출고 담당자를 선택하세요.");
+
+  const now = new Date();
+  const saveYmd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+  const toCenterMergedSlipNo = (row) => {
+    const centerRaw = String(row?.centerName || "").trim();
+    const centerBucket = resolveCenterBucket(row);
+    const centerKey = (centerRaw || centerBucket || "센터미정").replace(/\s+/g, "");
+    const storeInRaw = String(row?.storeInDate || row?.dueDate || row?.orderDate || row?.poDate || row?.centerInDate || "")
+      .trim()
+      .replace(/-/g, "");
+    const storeInCompact = normalizeDateCompact(storeInRaw) || "NODATE";
+    return `${centerKey}_${saveYmd}_${storeInCompact}`;
+  };
+
+  let confirmedLineCount = 0;
+  for (let i = 0; i < group.length; i++) {
+    const qty = Number(qMerged[String(i)]);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    confirmedLineCount += 1;
+    const centerMergedSlipNo = toCenterMergedSlipNo(group[i]);
+    addMovement(db, {
+      type: "OUT",
+      productCode: group[i].productCode,
+      qty,
+      warehouse: String(group[i].warehouse || "").trim() || String(process.env.WMS_DEFAULT_OUTBOUND_WH || "").trim() || "유통사업부",
+      partner: String(group[i].partner || "").trim(),
+      memo: "",
+      // 출고 이력 전표번호는 센터 통합 전표번호를 기록
+      slipNo: centerMergedSlipNo,
+      user: stockUser
+    });
+  }
+  if (!confirmedLineCount) throw new Error("확정할 출고확인 수량이 0입니다. 정상으로 변경 후 다시 시도하세요.");
+
+  db.outboundOrderUpload.slipWorkflow[key] = {
+    ...wfPrev,
+    status: "confirmed",
+    lineQtyByIndex: qMerged,
+    confirmedAt: new Date().toISOString()
+  };
+
+  const partnerTypeForRecord = String(group[0]?.partnerType || "").trim();
+  if (partnerTypeForRecord) {
+    db.outboundOrderUpload.confirmedLists[partnerTypeForRecord] = db.outboundOrderUpload.confirmedLists[partnerTypeForRecord] || {};
+    const recMap = db.outboundOrderUpload.confirmedLists[partnerTypeForRecord];
+    const recordGroups = {};
+    for (let i = 0; i < group.length; i++) {
+      const qty = Number(qMerged[String(i)]);
+      if (!Number.isFinite(qty) || qty <= 0) continue;
+      const recKey = toCenterMergedSlipNo(group[i]);
+      if (!recordGroups[recKey]) recordGroups[recKey] = [];
+      recordGroups[recKey].push({
+        slipNo: recKey,
+        sourceSlipNo: key,
+        productCode: group[i].productCode,
+        sourceProductCode: String(group[i].sourceProductCode || "").trim(),
+        mappedProductCode: String(group[i].mappedProductCode || "").trim(),
+        productName: group[i].productName || "",
+        barcode: String(group[i].barcode || "").trim(),
+        qty,
+        warehouse: String(group[i].warehouse || "").trim(),
+        lot: String(group[i].lot || "").trim(),
+        orderQty: String(group[i].orderQty || "").trim(),
+        fixedQty: String(group[i].fixedQty || "").trim(),
+        unshipStatus: String(group[i].unshipStatus || "").trim(),
+        unitPrice: String(group[i].unitPrice || "").trim(),
+        supplyAmt: String(group[i].supplyAmt || "").trim(),
+        vatAmt: String(group[i].vatAmt || "").trim(),
+        totalAmt: String(group[i].totalAmt || "").trim()
+      });
+    }
+
+    for (const [recKey, lineEntries] of Object.entries(recordGroups)) {
+      const centerNameFromKey = recKey.split("_")[0] || "";
+      const storeInFromKey = recKey.split("_")[2] || "";
+      if (!recMap[recKey]) {
+        recMap[recKey] = {
+          key: recKey,
+          partnerType: partnerTypeForRecord,
+          centerName: centerNameFromKey,
+          saveDateYmd: saveYmd,
+          storeInDateYmd: storeInFromKey,
+          slipNos: [],
+          lines: [],
+          updatedAt: now.toISOString()
+        };
+      }
+      recMap[recKey].lines = (recMap[recKey].lines || []).filter((ln) => ln && ln.sourceSlipNo !== key);
+      if (!recMap[recKey].slipNos.includes(key)) recMap[recKey].slipNos.push(key);
+      recMap[recKey].lines.push(...lineEntries);
+      recMap[recKey].updatedAt = now.toISOString();
+    }
+  }
+}
+
+function resolveCenterBucket(row) {
+  const name = String(row && row.centerName ? row.centerName : "").trim();
+  const code = String(row && row.centerCode ? row.centerCode : "").trim();
+  if (name.includes("여주") || code === "9120") return "여주";
+  if (name.includes("대구") || code === "9100") return "대구";
+  if (name.includes("시화") || code === "9110") return "시화";
+  return "";
+}
+
+function slipWorkflowPreservePurchaseFlags(wfPrev) {
+  const o = wfPrev && typeof wfPrev === "object" ? wfPrev : {};
+  return {
+    ecountPurchaseSavedAt: o.ecountPurchaseSavedAt,
+    wmsStockInboundAt: o.wmsStockInboundAt
+  };
+}
+
+function removeInboundSlipConfirmLogByKey(db, slipKeyNorm) {
+  if (!Array.isArray(db.inboundSlipConfirmLog)) return;
+  db.inboundSlipConfirmLog = db.inboundSlipConfirmLog.filter(
+    (e) => !e || normalizeSlipNoText(e.slipNo) !== slipKeyNorm
+  );
+}
+
+function resolveInboundPlanStockUser(db, body, group) {
+  const fromBody = String(body.stockUser || "").trim();
+  if (fromBody) {
+    if (!db.managers.includes(fromBody)) throw new Error(`WMS 입고 담당자 "${fromBody}"는 등록된 담당자가 아닙니다.`);
+    return fromBody;
+  }
+  const fromEnv = String(process.env.INBOUND_PLAN_STOCK_USER || "").trim();
+  if (fromEnv) {
+    if (!db.managers.includes(fromEnv)) throw new Error(`INBOUND_PLAN_STOCK_USER("${fromEnv}")는 등록된 담당자가 아닙니다.`);
+    return fromEnv;
+  }
+  const mgr = String(group[0]?.manager || "").trim();
+  if (mgr && db.managers.includes(mgr)) return mgr;
+  throw new Error(
+    "WMS 입고 담당자를 지정해 주세요. 전표 상세의 「WMS 입고 담당자」에서 선택하거나 .env에 INBOUND_PLAN_STOCK_USER=등록된담당자명 을 설정하세요."
+  );
+}
+
+function resolveInboundPlanRollbackUser(db, body, group, wfPrev) {
+  const fromBody = String(body && body.stockUser ? body.stockUser : "").trim();
+  if (fromBody && db.managers.includes(fromBody)) return fromBody;
+  const fromWorkflow = String(wfPrev && wfPrev.stockUser ? wfPrev.stockUser : "").trim();
+  if (fromWorkflow && db.managers.includes(fromWorkflow)) return fromWorkflow;
+  const fromEnv = String(process.env.INBOUND_PLAN_STOCK_USER || "").trim();
+  if (fromEnv && db.managers.includes(fromEnv)) return fromEnv;
+  const mgr = String(group[0]?.manager || "").trim();
+  if (mgr && db.managers.includes(mgr)) return mgr;
+  if (Array.isArray(db.managers) && db.managers.length) return String(db.managers[0]).trim();
+  throw new Error("등록된 담당자가 없어 재고 원복을 처리할 수 없습니다. 기본정보 > 담당자를 먼저 등록하세요.");
+}
+
+function resolveInboundPlanWarehouseName(db, group) {
+  const wh = String(group[0]?.whName || "").trim();
+  if (wh) {
+    if (!db.warehouses.includes(wh)) {
+      throw new Error(`WMS에 등록되지 않은 창고입니다: "${wh}". 마스터에서 동일한 창고명으로 등록하세요.`);
+    }
+    return wh;
+  }
+  const fallback = String(process.env.WMS_DEFAULT_INBOUND_WH || "").trim();
+  if (fallback) {
+    if (!db.warehouses.includes(fallback)) {
+      throw new Error(`WMS_DEFAULT_INBOUND_WH("${fallback}")는 등록된 창고가 아닙니다.`);
+    }
+    return fallback;
+  }
+  throw new Error(
+    "입고창고(엑셀)가 비어 있습니다. 엑셀에 창고명을 채우거나 .env에 WMS_DEFAULT_INBOUND_WH=등록된창고명 을 설정하세요."
+  );
+}
+
+function assertUploadSlipWmsInboundReady(db, group, lineQtyByIndex) {
+  const warehouse = resolveInboundPlanWarehouseName(db, group);
+  const qtyMap = lineQtyByIndex && typeof lineQtyByIndex === "object" ? lineQtyByIndex : {};
+  for (let idx = 0; idx < group.length; idx++) {
+    const row = group[idx];
+    const productCode = String(row.itemCode || "").trim();
+    const qRaw = qtyMap[String(idx)] != null ? qtyMap[String(idx)] : row.qty;
+    const n = Math.round(Number(String(qRaw ?? "").replace(/,/g, "")));
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`행 ${idx + 1}: 입고확인 수량을 1 이상으로 입력하세요.`);
+    }
+    const product = db.products.find((p) => p.code === productCode);
+    if (!product) throw new Error(`WMS에 없는 상품코드입니다: ${productCode} (행 ${idx + 1}). 상품 마스터를 등록하세요.`);
+    const usedWarehouses = toTagList(product.usedWarehouses);
+    if (usedWarehouses.length && !usedWarehouses.includes(warehouse)) {
+      throw new Error(
+        `상품 ${productCode}: 창고 "${warehouse}"에서 입고할 수 없습니다. 사용창고: ${usedWarehouses.join(", ")}`
+      );
+    }
+  }
+  return warehouse;
+}
+
+function applyWmsStockInboundFromUploadSlip(db, group, lineQtyByIndex, slipNoDisplay, user) {
+  const warehouse = resolveInboundPlanWarehouseName(db, group);
+  const qtyMap = lineQtyByIndex && typeof lineQtyByIndex === "object" ? lineQtyByIndex : {};
+  for (let idx = 0; idx < group.length; idx++) {
+    const row = group[idx];
+    const productCode = String(row.itemCode || "").trim();
+    const qRaw = qtyMap[String(idx)] != null ? qtyMap[String(idx)] : row.qty;
+    const n = Math.round(Number(String(qRaw ?? "").replace(/,/g, "")));
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`WMS 입고 수량 오류(행 ${idx + 1}, 품목 ${productCode || "-"})`);
+    }
+    addMovement(db, {
+      type: "IN",
+      productCode,
+      qty: n,
+      warehouse,
+      partner: String(row.vendor || "").trim() || String(group[0]?.vendor || "").trim(),
+      memo: "",
+      slipNo: String(slipNoDisplay || "").trim(),
+      user
+    });
+  }
+}
+
+function rollbackWmsStockInboundFromUploadSlip(db, group, lineQtyByIndex, slipNoDisplay, user) {
+  const warehouse = resolveInboundPlanWarehouseName(db, group);
+  const qtyMap = lineQtyByIndex && typeof lineQtyByIndex === "object" ? lineQtyByIndex : {};
+  const memoBase = `입고확정 취소 원복 ${String(slipNoDisplay || "").trim()}`;
+  for (let idx = 0; idx < group.length; idx++) {
+    const row = group[idx];
+    const productCode = String(row.itemCode || "").trim();
+    const qRaw = qtyMap[String(idx)] != null ? qtyMap[String(idx)] : row.qty;
+    const n = Math.round(Number(String(qRaw ?? "").replace(/,/g, "")));
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`재고 원복 수량 오류(행 ${idx + 1}, 품목 ${productCode || "-"})`);
+    }
+    addMovement(db, {
+      type: "ADJUST",
+      productCode,
+      qty: -Math.abs(n),
+      warehouse,
+      partner: "",
+      memo: memoBase,
+      slipNo: String(slipNoDisplay || "").trim(),
+      user
+    });
+  }
+}
+
+/** 입고예정목록 2 업로드 전표 → SavePurchases (확정 상태에서만 호출) */
+function buildSavePurchasesPayloadFromUploadSlip(rawLinesSorted, lineQtyByIndex) {
+  const rows = Array.isArray(rawLinesSorted) ? rawLinesSorted : [];
+  if (!rows.length) throw new Error("품목 행이 없습니다.");
+  const first = rows[0];
+  const cust = String(first.vendorCode || "").trim();
+  const custDes = String(first.vendor || "").trim();
+  const whCd = String(process.env.ECOUNT_DEFAULT_WH_CD || "").trim();
+  const ioDate =
+    ymdOrCompactForPurchasesSave(first.poDate) ||
+    ymdOrCompactForPurchasesSave(slipDateFromEcountSlipCell(first.slipNo)) ||
+    normalizeDateCompact(new Date().toISOString().slice(0, 10));
+  if (!cust) throw new Error("거래처코드(엑셀 거래처코드)가 없습니다.");
+  if (!whCd) {
+    throw new Error(
+      "창고코드(WH_CD)가 필요합니다. .env에 ECOUNT_DEFAULT_WH_CD=이카운트창고코드 를 설정하세요. (엑셀은 창고명만 있는 경우가 많습니다.)"
+    );
+  }
+
+  const qtyMap = lineQtyByIndex && typeof lineQtyByIndex === "object" ? lineQtyByIndex : {};
+  const PurchasesList = rows.map((row, idx) => {
+    const qRaw = qtyMap[String(idx)] != null ? qtyMap[String(idx)] : row.qty;
+    const n = Number(String(qRaw ?? "").replace(/,/g, ""));
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`수량이 올바르지 않습니다(행 ${idx + 1}, 품목 ${row.itemCode || "-"}).`);
+    }
+    const bulk = {
+      IO_DATE: ioDate,
+      CUST: cust,
+      CUST_DES: custDes,
+      WH_CD: whCd,
+      PROD_CD: String(row.itemCode || "").trim(),
+      PROD_DES: String(row.itemName || "").trim(),
+      QTY: String(Math.round(n))
+    };
+    const due = ymdOrCompactForPurchasesSave(row.dueDate);
+    if (due) bulk.TIME_DATE = due;
+    const ref = String(row.remark || "").trim();
+    if (ref) bulk.REF_DES = ref;
+    const memo = String(row.note || "").trim();
+    if (memo) bulk.MEMO = memo;
+    const emp = String(row.manager || "").trim();
+    if (emp) bulk.EMP_CD = emp;
+    return { BulkDatas: bulk };
+  });
+  return { PurchasesList };
+}
+
+/** 출고 확정 묶음 → Sale/SaveSale 본문 (SaleList[].BulkDatas). */
+function resolveEcountOutboundProdForSale(db, partnerType, productCodeRaw, productNameFallback) {
+  const src = String(productCodeRaw || "").trim();
+  if (!src) throw new Error("상품코드가 비어 있습니다.");
+  const nameFb = String(productNameFallback || "").trim();
+  const codeMap = getOutboundCodeMasterMap(db, partnerType);
+  const mapped = codeMap.get(src);
+  if (mapped) {
+    return { prodCd: mapped, prodDes: nameFb };
+  }
+  const p = findProductByMovementImportCode(db, src);
+  if (p) {
+    const prodCd = String(p.ecountCode || p.code || "").trim();
+    const prodDes = String(p.name || p.ecountName || nameFb || "").trim();
+    if (!prodCd) throw new Error(`품목 ${src}: 이카운트 품목코드(ecountCode)가 없습니다.`);
+    return { prodCd, prodDes };
+  }
+  return { prodCd: src, prodDes: nameFb };
+}
+
+function outboundLineWarehouseToEcountWhCd(lineWarehouse) {
+  const forced = String(process.env.ECOUNT_OUTBOUND_SALE_WH_CD || "").trim();
+  if (forced) return forced;
+  const w = String(lineWarehouse || "").trim();
+  if (w && w.length <= 8 && !/사업부|창고|센터|물류|본사/.test(w)) return w;
+  const fallback = String(process.env.ECOUNT_DEFAULT_WH_CD || "").trim();
+  if (!fallback) {
+    throw new Error(
+      "판매입력 창고코드(WH_CD)가 필요합니다. .env에 ECOUNT_OUTBOUND_SALE_WH_CD 또는 ECOUNT_DEFAULT_WH_CD 를 설정하세요."
+    );
+  }
+  return fallback;
+}
+
+function buildSaveSalePayloadFromConfirmRecord(db, record, partnerType) {
+  const lines = Array.isArray(record.lines) ? record.lines : [];
+  if (!lines.length) throw new Error("확정 품목 행이 없습니다.");
+  const ioDate =
+    String(record.storeInDateYmd || "").trim().replace(/-/g, "") ||
+    String(record.saveDateYmd || "").trim().replace(/-/g, "") ||
+    normalizeDateCompact(new Date().toISOString().slice(0, 10));
+  if (!ioDate || ioDate.length !== 8) throw new Error("확정일자(saveDateYmd)가 올바르지 않습니다.");
+  const custByPartner = {
+    emart: String(process.env.ECOUNT_OUTBOUND_SALE_CUST_EMART || "2068650913").trim(),
+    daiso: String(process.env.ECOUNT_OUTBOUND_SALE_CUST_DAISO || "").trim(),
+    lotte: String(process.env.ECOUNT_OUTBOUND_SALE_CUST_LOTTE || "").trim()
+  };
+  const cust = String(custByPartner[partnerType] || process.env.ECOUNT_OUTBOUND_SALE_CUST || "").trim();
+  const custDes = String(process.env.ECOUNT_OUTBOUND_SALE_CUST_DES || "").trim();
+  const empCd = String(process.env.ECOUNT_OUTBOUND_SALE_EMP_CD || "").trim();
+  const listKey = String(record.key || "").trim();
+  // 기본은 자동번호(빈 문자열) 사용. 환경변수로만 고정 전표번호를 명시 허용.
+  const docNo = String(process.env.ECOUNT_OUTBOUND_SALE_DOC_NO || "").trim();
+  const centerRemark = String(record.centerName || "").trim();
+  const remarks = (centerRemark || `WMS ${partnerType} ${listKey}`).slice(0, 200);
+  const ioType = String(process.env.ECOUNT_OUTBOUND_SALE_IO_TYPE || "").trim();
+  const price = String(process.env.ECOUNT_OUTBOUND_SALE_PRICE ?? "0").trim() || "0";
+  const codeMap = getOutboundCodeMasterMap(db, partnerType);
+
+  const num = (v) => {
+    if (v === "" || v === null || v === undefined) return NaN;
+    const n = Number(String(v).replace(/[^\d.-]/g, "").trim());
+    return Number.isFinite(n) ? n : NaN;
+  };
+
+  const agg = new Map();
+  for (const ln of lines) {
+    const qty = Number(ln.qty);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    // WMS 상품마스터 + 코드마스터를 함께 사용해 PROD_CD를 확정한다.
+    const rawProductCode = String(ln.productCode || "").trim();
+    const sourceProductCode = String(ln.sourceProductCode || "").trim();
+    const barcodeCode = String(ln.barcode || "").trim();
+    const candidates = [
+      rawProductCode,
+      sourceProductCode,
+      barcodeCode,
+      rawProductCode.replace(/-\d+$/, ""),
+      sourceProductCode.replace(/-\d+$/, ""),
+      barcodeCode.replace(/-\d+$/, "")
+    ]
+      .map((x) => String(x || "").trim())
+      .filter(Boolean);
+
+    let p = null;
+    for (const c of candidates) {
+      p = findProductByMovementImportCode(db, c);
+      if (p) break;
+    }
+
+    let mappedCode = "";
+    for (const c of candidates) {
+      const hit = codeMap.get(c) || codeMap.get(normalizeInputLoose(c)) || codeMap.get(c.replace(/\.0+$/, ""));
+      if (hit) {
+        mappedCode = String(hit).trim();
+        break;
+      }
+    }
+
+    const productCodeResolved = String((p && (p.ecountCode || p.code)) || mappedCode || "").trim();
+    if (!productCodeResolved) {
+      throw new Error(
+        `전송용 품목코드를 찾지 못했습니다. 원본:${rawProductCode || "-"} / SKU:${sourceProductCode || "-"} / 바코드:${barcodeCode || "-"}`
+      );
+    }
+    const prodCd = String(productCodeResolved).trim();
+    const prodDes = String(ln.productName || p?.name || p?.ecountName || "").trim();
+    if (!prodDes) {
+      throw new Error(
+        `품목 ${String(ln.productCode || "").trim()}: 이카운트 판매입력에 필요한 품목명(PROD_DES)이 없습니다.`
+      );
+    }
+    const whCd = outboundLineWarehouseToEcountWhCd(ln.warehouse);
+    const unitPrice = num(ln.unitPrice);
+    const supplyAmt = num(ln.supplyAmt);
+    const vatAmt = num(ln.vatAmt);
+    const totalAmt = num(ln.totalAmt);
+    // 바코드는 PROD_CD로 전달하고, ITEM_CD/P_REMARKS1에는 넣지 않음.
+    const itemCd = "";
+    const k = `${prodCd}\t${whCd}\t${Number.isFinite(unitPrice) ? unitPrice : ""}\t${itemCd}`;
+    const prev = agg.get(k);
+    const supplyResolved = Number.isFinite(supplyAmt)
+      ? supplyAmt
+      : Number.isFinite(totalAmt) && Number.isFinite(vatAmt)
+        ? totalAmt - vatAmt
+        : Number.isFinite(totalAmt) && !Number.isFinite(vatAmt)
+          ? totalAmt
+        : Number.isFinite(unitPrice)
+          ? unitPrice * qty
+          : NaN;
+    const vatResolved =
+      Number.isFinite(vatAmt)
+        ? vatAmt
+        : Number.isFinite(totalAmt) && Number.isFinite(supplyResolved)
+          ? totalAmt - supplyResolved
+          : Number.isFinite(supplyResolved)
+            ? Math.round(supplyResolved * 0.1)
+            : 0;
+    const totalResolved = Number.isFinite(totalAmt) ? totalAmt : Number.isFinite(supplyResolved) ? supplyResolved + vatResolved : NaN;
+    if (prev) {
+      prev.qty += qty;
+      if (Number.isFinite(supplyResolved)) prev.supplyAmt += supplyResolved;
+      if (Number.isFinite(vatResolved)) prev.vatAmt += vatResolved;
+      if (Number.isFinite(totalResolved)) prev.totalAmt += totalResolved;
+    } else {
+      agg.set(k, {
+        prodCd,
+        prodDes,
+        whCd,
+        qty,
+        unitPrice: Number.isFinite(unitPrice) ? unitPrice : NaN,
+        supplyAmt: Number.isFinite(supplyResolved) ? supplyResolved : NaN,
+        vatAmt: Number.isFinite(vatResolved) ? vatResolved : NaN,
+        totalAmt: Number.isFinite(totalResolved) ? totalResolved : NaN,
+        itemCd
+      });
+    }
+  }
+  if (!agg.size) throw new Error("전송할 수량이 있는 품목이 없습니다.");
+
+  const SaleList = [...agg.values()].map((row) => ({
+    BulkDatas: {
+      IO_DATE: ioDate,
+      UPLOAD_SER_NO: "",
+      CUST: cust,
+      CUST_DES: custDes,
+      EMP_CD: empCd,
+      WH_CD: row.whCd,
+      IO_TYPE: ioType,
+      EXCHANGE_TYPE: "",
+      EXCHANGE_RATE: "",
+      REMARKS: "",
+      DOC_NO: docNo,
+      PROD_CD: row.prodCd,
+      PROD_DES: row.prodDes,
+      QTY: String(Math.trunc(row.qty)),
+      ITEM_CD: row.itemCd || "",
+      PRICE: Number.isFinite(row.unitPrice) ? String(row.unitPrice) : price,
+      SUPPLY_AMT: Number.isFinite(row.supplyAmt) ? String(Math.trunc(row.supplyAmt)) : "",
+      VAT_AMT: Number.isFinite(row.vatAmt) ? String(Math.trunc(row.vatAmt)) : "",
+      CUST_AMT: "",
+      TTL_CTT: remarks,
+      U_MEMO2: remarks,
+      P_REMARKS1: "",
+      REMARKS1: "",
+      REMARKS2: "",
+      REMARKS3: ""
+    }
+  }));
+  return { SaleList };
+}
+
+function throwIfEcountSaveSaleFailed(result) {
+  if (!result.ok) {
+    throw new Error(`이카운트 Sale/SaveSale HTTP ${result.status}: ${String(result.text || "").slice(0, 500)}`);
+  }
+  const d = result.data;
+  if (!d || typeof d !== "object") {
+    throw new Error(`이카운트 응답 파싱 실패: ${String(result.text || "").slice(0, 400)}`);
+  }
+  const st = String(d.Status ?? "");
+  if (st === "500" || st === "400") {
+    const msg =
+      (d.Error && d.Error.Message) ||
+      (Array.isArray(d.Errors) && d.Errors[0] && d.Errors[0].Message) ||
+      JSON.stringify(d.Errors || d.Error || {}).slice(0, 400);
+    throw new Error(`이카운트 판매입력: ${msg}`);
+  }
+  if (st && st !== "200") {
+    throw new Error(`이카운트 판매입력 Status=${st}: ${String(result.text || "").slice(0, 400)}`);
+  }
+  const data = d.Data;
+  if (data && Number(data.FailCnt) > 0) {
+    const details = Array.isArray(data.ResultDetails) ? data.ResultDetails : [];
+    const msgs = details
+      .filter((x) => x && x.IsSuccess === false)
+      .map((x) =>
+        x.TotalError ||
+        (Array.isArray(x.Errors) ? x.Errors.map((e) => `${String(e.ColCd || "")}:${String(e.Message || "")}`).join("; ") : "")
+      )
+      .filter(Boolean);
+    throw new Error(`이카운트 판매입력 라인 오류: ${msgs.join(" | ") || JSON.stringify(data).slice(0, 500)}`);
+  }
+}
+
+function isOnlyItemCdRegistrationError(ecountData) {
+  const details = Array.isArray(ecountData?.Data?.ResultDetails) ? ecountData.Data.ResultDetails : [];
+  if (!details.length) return false;
+  let hasAny = false;
+  for (const d of details) {
+    if (!d || d.IsSuccess === true) continue;
+    const errs = Array.isArray(d.Errors) ? d.Errors : [];
+    if (!errs.length) return false;
+    for (const e of errs) {
+      const col = String(e?.ColCd || "").trim().toUpperCase();
+      const msg = String(e?.Message || "");
+      if (col !== "ITEM_CD" && !/바코드|item.?cd|미등록코드/i.test(msg)) return false;
+      hasAny = true;
+    }
+  }
+  return hasAny;
+}
+
+function clearItemCdInSalePayload(payload) {
+  const src = payload && typeof payload === "object" ? payload : {};
+  const list = Array.isArray(src.SaleList) ? src.SaleList : [];
+  const next = list.map((row) => {
+    const bulk = row && row.BulkDatas && typeof row.BulkDatas === "object" ? { ...row.BulkDatas } : {};
+    bulk.ITEM_CD = "";
+    return { ...row, BulkDatas: bulk };
+  });
+  return { ...src, SaleList: next };
+}
+
+async function postEcountSaveSale(salePayload) {
+  const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+  if (!comCode) throw new Error("ECOUNT_COM_CODE가 필요합니다.");
+  const sessionId = await fetchEcountSession();
+  const apiBase = await fetchEcountApiBase(comCode);
+  return postEcountOapiV2(apiBase, sessionId, "Sale/SaveSale", salePayload);
+}
+
+function findOutboundConfirmListKeyForSlip(db, partnerType, slipNoInput) {
+  const key = normalizeSlipNoText(slipNoInput);
+  if (!key) return "";
+  const recMap = db.outboundOrderUpload.confirmedLists && db.outboundOrderUpload.confirmedLists[partnerType];
+  if (!recMap || typeof recMap !== "object") return "";
+  for (const [listKey, rec] of Object.entries(recMap)) {
+    const nums = Array.isArray(rec && rec.slipNos) ? rec.slipNos : [];
+    for (const s of nums) {
+      if (normalizeSlipNoText(String(s || "")) === key) return String(listKey || "").trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * 확정리스트 묶음 단위로 이카운트 Sale/SaveSale 호출 후 slipWorkflow 전송 처리.
+ * @returns {{ ok: boolean, sentNow: number, total: number, ecount?: object, alreadyComplete?: boolean, salePayload?: object }}
+ */
+async function runOutboundConfirmListSalesToEcount(db, partnerType, listKey) {
+  db.outboundOrderUpload.confirmedLists = db.outboundOrderUpload.confirmedLists || {};
+  db.outboundOrderUpload.confirmedLists[partnerType] = db.outboundOrderUpload.confirmedLists[partnerType] || {};
+  const recMap = db.outboundOrderUpload.confirmedLists[partnerType];
+  const record = recMap[listKey];
+  if (!record) throw new Error("해당 확정 저장 내역을 찾을 수 없습니다.");
+
+  const slipKeys = Array.isArray(record.slipNos)
+    ? [...new Set(record.slipNos.map((s) => normalizeSlipNoText(String(s || ""))).filter(Boolean))]
+    : [];
+  if (!slipKeys.length) throw new Error("해당 확정 묶음에 전표가 없습니다.");
+
+  for (const sk of slipKeys) {
+    const wfPrev = db.outboundOrderUpload.slipWorkflow[sk] || { status: "draft", lineQtyByIndex: {} };
+    if (!["confirmed", "sent"].includes(String(wfPrev.status || ""))) {
+      throw new Error(`출고확정 후에 판매입력을 전송할 수 있습니다: ${sk}`);
+    }
+  }
+
+  let salePayload = buildSaveSalePayloadFromConfirmRecord(db, record, partnerType);
+  let result = await postEcountSaveSale(salePayload);
+  let retriedWithoutItemCd = false;
+  const allowEmptyItemCdRetry = ["1", "true", "yes", "on"].includes(
+    String(process.env.ECOUNT_OUTBOUND_SALE_ITEMCD_RETRY_EMPTY || "").trim().toLowerCase()
+  );
+  if (allowEmptyItemCdRetry && isOnlyItemCdRegistrationError(result.data)) {
+    salePayload = clearItemCdInSalePayload(salePayload);
+    result = await postEcountSaveSale(salePayload);
+    retriedWithoutItemCd = true;
+  }
+  throwIfEcountSaveSaleFailed(result);
+
+  let sentNow = 0;
+  for (const sk of slipKeys) {
+    const wfPrev = db.outboundOrderUpload.slipWorkflow[sk] || { status: "draft", lineQtyByIndex: {} };
+    db.outboundOrderUpload.slipWorkflow[sk] = { ...wfPrev, status: "sent", sentAt: new Date().toISOString() };
+    sentNow += 1;
+  }
+
+  db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+  writeDb(db);
+  return {
+    ok: true,
+    sentNow,
+    total: slipKeys.length,
+    ecount: result.data,
+    salePayload,
+    retriedWithoutItemCd
+  };
+}
+
 /** 이카운트 발주서현황 엑셀의 「일자-No.」에서 날짜 부분 → YYYY-MM-DD */
 function slipDateFromEcountSlipCell(slipRaw) {
   const s = String(slipRaw || "").trim();
@@ -1015,8 +2250,9 @@ function mergeInboundPlanUploadByNewSlipsOnly(existingLines, incomingLines) {
   };
 }
 
-function aggregateInboundPlanUploadLines(lines) {
+function aggregateInboundPlanUploadLines(lines, slipWorkflow = {}) {
   const arr = Array.isArray(lines) ? lines : [];
+  const wf = slipWorkflow && typeof slipWorkflow === "object" ? slipWorkflow : {};
   const by = new Map();
   for (const row of arr) {
     const k = normalizeSlipNoText(row.slipNo);
@@ -1025,10 +2261,15 @@ function aggregateInboundPlanUploadLines(lines) {
     by.get(k).push(row);
   }
   const items = [];
-  for (const [, group] of by) {
+  for (const [slipKey, group] of by) {
     group.sort((a, b) => String(a.itemCode).localeCompare(String(b.itemCode)));
     const first = group[0];
-    const totalQty = group.reduce((s, x) => s + (Number(x.qty) || 0), 0);
+    const w = wf[slipKey];
+    const qMap = w && w.lineQtyByIndex && typeof w.lineQtyByIndex === "object" ? w.lineQtyByIndex : {};
+    const totalQty = group.reduce((s, x, idx) => {
+      const q = qMap[String(idx)] != null ? Number(qMap[String(idx)]) : Number(x.qty) || 0;
+      return s + (Number.isFinite(q) ? q : 0);
+    }, 0);
     const names = group.map((x) => x.itemName).filter(Boolean);
     const itemSummary = names.length <= 1 ? (names[0] || "") : `${names[0]} 외 ${names.length - 1}건`;
     items.push({
@@ -1042,7 +2283,8 @@ function aggregateInboundPlanUploadLines(lines) {
       whName: first.whName || "",
       status: "업로드",
       lineCount: group.length,
-      lastModifiedAt: pickLatestDateTimeText(group.map((x) => x.lastModifiedAt))
+      lastModifiedAt: pickLatestDateTimeText(group.map((x) => x.lastModifiedAt)),
+      workflowStatus: w && w.status === "confirmed" ? "confirmed" : "draft"
     });
   }
   items.sort((a, b) => String(a.poNo).localeCompare(String(b.poNo), "ko"));
@@ -1051,6 +2293,7 @@ function aggregateInboundPlanUploadLines(lines) {
 
 function inboundPlanUploadLinesToDetailRows(lines, slipKeyNorm) {
   const group = (Array.isArray(lines) ? lines : []).filter((x) => normalizeSlipNoText(x.slipNo) === slipKeyNorm);
+  group.sort((a, b) => String(a.itemCode).localeCompare(String(b.itemCode)));
   return group.map((x) => ({
     poNo: x.slipNo,
     poDate: x.poDate,
@@ -1061,6 +2304,7 @@ function inboundPlanUploadLinesToDetailRows(lines, slipKeyNorm) {
     spec: x.spec,
     barcode: x.barcode,
     boxQty: "",
+    orderQty: x.qty,
     qty: x.qty,
     dueDate: x.dueDate,
     whName: x.whName,
@@ -1354,6 +2598,252 @@ async function postEcountOapiV2(apiBase, sessionId, v2Path, body) {
   return result;
 }
 
+/** GET /api/inbound-plans/detail 과 동일하게 발주 slipNo 의 품목 행까지 조회 */
+async function fetchEcountPurchaseOrderMatchedLines(slipNo, from, to) {
+  const slipNoTrim = String(slipNo || "").trim();
+  if (!slipNoTrim) throw new Error("전표번호(slipNo)가 필요합니다.");
+
+  const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+  const fromCompact = normalizeDateCompact(from);
+  const toCompact = normalizeDateCompact(to);
+  const baseDate = toCompact || fromCompact || normalizeDateCompact(new Date().toISOString().slice(0, 10));
+  const range = clampDateRangeToMax30Days(fromCompact || baseDate, toCompact || baseDate);
+
+  const sessionId = await fetchEcountSession();
+  const apiBase = await fetchEcountApiBase(comCode);
+  const basePayload = {
+    PROD_CD: "",
+    CUST_CD: "",
+    ListParam: {
+      BASE_DATE_FROM: range.fromCompact,
+      BASE_DATE_TO: range.toCompact,
+      PAGE_CURRENT: 1,
+      PAGE_SIZE: 100
+    }
+  };
+  const target = normalizeSlipNoText(slipNoTrim);
+  const seq = target.split("-").pop() || "";
+  const endpointErrors = [];
+  const skipBuiltinLineApis = shouldSkipBuiltinLineApis();
+  let usedEndpoint = "GetPurchasesOrderList";
+  let rawRows = [];
+
+  const listUrl = `${apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=${encodeURIComponent(sessionId)}`;
+  const listResp = await fetch(listUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(basePayload)
+  });
+  if (!listResp.ok) {
+    const txt = await listResp.text();
+    throw new Error(`발주 목록 조회 실패(${listResp.status}): ${txt.slice(0, 300)}`);
+  }
+  const listData = await listResp.json();
+  rawRows = extractArrayFromUnknown(listData);
+
+  const headerRaw = findMatchingRawOrderRow(rawRows, target, seq, range.toCompact);
+  const ordNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : "";
+  const ioNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
+  let matched = [];
+  let lineSource = "header-flat";
+  let nestedLineCount = 0;
+  let narrowListTried = false;
+
+  if (headerRaw) {
+    const nestedLines = extractNestedLineRowsFromOrderRow(headerRaw);
+    nestedLineCount = nestedLines.length;
+    if (nestedLines.length) {
+      const merged = mergeOrderHeaderWithLines(headerRaw, nestedLines);
+      matched = normalizeInboundPlanRows(merged, range.toCompact);
+      lineSource = "nested-lines";
+    }
+  }
+
+  if (!matched.length && headerRaw) {
+    const narrowAttempts = [];
+    if (ordNoRawEarly) {
+      narrowAttempts.push({
+        label: "ListParam.ORD_NO",
+        body: { ...basePayload, ListParam: { ...basePayload.ListParam, ORD_NO: ordNoRawEarly } }
+      });
+      narrowAttempts.push({ label: "root.ORD_NO", body: { ...basePayload, ORD_NO: ordNoRawEarly } });
+    }
+    if (ioNoRawEarly) {
+      narrowAttempts.push({
+        label: "ListParam.IO_NO",
+        body: { ...basePayload, ListParam: { ...basePayload.ListParam, IO_NO: ioNoRawEarly } }
+      });
+    }
+    for (const na of narrowAttempts) {
+      narrowListTried = true;
+      try {
+        const nr = await fetch(listUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(na.body)
+        });
+        if (!nr.ok) continue;
+        const nd = await nr.json();
+        const nrows = extractArrayFromUnknown(nd);
+        const h2 = findMatchingRawOrderRow(nrows, target, seq, range.toCompact) || nrows[0];
+        if (!h2) continue;
+        const nl = extractNestedLineRowsFromOrderRow(h2);
+        if (nl.length) {
+          nestedLineCount = nl.length;
+          matched = normalizeInboundPlanRows(mergeOrderHeaderWithLines(h2, nl), range.toCompact);
+          lineSource = `narrow-list-${na.label}`;
+          break;
+        }
+      } catch (_) {
+        // ignore narrow failures
+      }
+    }
+  }
+
+  const envLinePaths = parseInboundLineApiPathSpecs(process.env.ECOUNT_INBOUND_LINE_API_PATHS || "");
+  if (!matched.length && envLinePaths.length) {
+    const ordNoL = ordNoRawEarly || seq;
+    const ioNoL = ioNoRawEarly;
+    const bodiesL = buildLineLookupBodies(basePayload, slipNoTrim, ordNoL, ioNoL);
+    outerEnvLines: for (const v2Path of envLinePaths) {
+      for (const body of bodiesL.length ? bodiesL : [basePayload]) {
+        try {
+          const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, v2Path, body);
+          if (!ok) {
+            endpointErrors.push(`${v2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
+            continue;
+          }
+          const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+          if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+            endpointErrors.push(`${v2Path}:no-item-lines`);
+            continue;
+          }
+          matched = cand;
+          usedEndpoint = v2Path;
+          lineSource = `env-line-api-${kind}`;
+          break outerEnvLines;
+        } catch (err) {
+          endpointErrors.push(`${v2Path}:network ${err?.message || String(err)}`);
+        }
+      }
+    }
+  }
+
+  const customDetailApi = String(process.env.ECOUNT_INBOUND_DETAIL_API || "").trim();
+  if (!matched.length && customDetailApi) {
+    const ordNoRaw = ordNoRawEarly || seq;
+    const ioNoRaw = ioNoRawEarly;
+    const customV2Path = customDetailApi.includes("/") ? customDetailApi.replace(/^\/+/, "") : `Purchases/${customDetailApi}`;
+    const customBodies = buildLineLookupBodies(basePayload, slipNoTrim, ordNoRaw, ioNoRaw);
+    outerCustom: for (const body of customBodies.length ? customBodies : [basePayload]) {
+      try {
+        const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, customV2Path, body);
+        if (!ok) {
+          endpointErrors.push(`${customV2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
+          continue;
+        }
+        const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+        if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+          endpointErrors.push(`${customV2Path}:no-item-lines`);
+          continue;
+        }
+        matched = cand;
+        usedEndpoint = customV2Path;
+        lineSource = `custom-detail-api-${kind}`;
+        break outerCustom;
+      } catch (err) {
+        endpointErrors.push(`${customV2Path}:network ${err?.message || String(err)}`);
+      }
+    }
+  }
+
+  if (!matched.length && !skipBuiltinLineApis) {
+    const ordNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : seq;
+    const ioNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
+    const lineBodies = buildLineLookupBodies(basePayload, slipNoTrim, ordNoRaw, ioNoRaw);
+    const purchaseMethods = [
+      "GetPurchases",
+      "GetPurchasesOrderDetail",
+      "GetPurchaseOrderDetail",
+      "GetPurchasesOrderInfo",
+      "GetPurchasesDetail"
+    ];
+    const extraModulePaths = [
+      "Purchases/GetReadPurchases",
+      "Purchases/ReadPurchases",
+      "Purchases/GetPurchasesList",
+      "Stock/GetPurchases",
+      "Inventory/GetPurchases",
+      "Inventory/GetPurchaseList"
+    ];
+    const detailAttempts = [];
+    for (const method of purchaseMethods) {
+      for (const body of lineBodies) {
+        detailAttempts.push({ path: `Purchases/${method}`, body });
+      }
+    }
+    for (const path of extraModulePaths) {
+      for (const body of lineBodies) {
+        detailAttempts.push({ path, body });
+      }
+    }
+
+    outerBuiltin: for (const c of detailAttempts) {
+      try {
+        const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, c.path, c.body);
+        if (!ok) {
+          endpointErrors.push(`${c.path}:(${status}) ${String(text || "").slice(0, 120)}`);
+          continue;
+        }
+        const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
+        if (kind === "empty" || !filterLikelyItemLines(cand).length) {
+          endpointErrors.push(`${c.path}:no-item-lines`);
+          continue;
+        }
+        matched = cand;
+        usedEndpoint = c.path;
+        lineSource = `detail-api-${kind}`;
+        break outerBuiltin;
+      } catch (err) {
+        endpointErrors.push(`${c.path}:network ${err?.message || String(err)}`);
+      }
+    }
+  }
+
+  if (!matched.length) {
+    const items = normalizeInboundPlanRows(rawRows, range.toCompact);
+    matched = items.filter((x) => normalizeSlipNoText(x.poNo) === target);
+    if (!matched.length) {
+      matched = items.filter((x) => normalizeSlipNoText(x.poNo).endsWith(`-${seq}`));
+    }
+    lineSource = "list-summary-fallback";
+  }
+
+  const lineLike = matched.filter((x) => {
+    const hasCode = String(x.itemCode || "").trim() !== "";
+    const hasQty = String(x.qty || "").trim() !== "";
+    const isSummaryTitle = /외\s*\d+건/.test(String(x.itemName || ""));
+    return (hasCode || hasQty) && !isSummaryTitle;
+  });
+  if (lineLike.length) matched = lineLike;
+
+  return {
+    matched,
+    headerRaw,
+    rawRows,
+    range,
+    sessionId,
+    apiBase,
+    usedEndpoint,
+    lineSourceFinal: lineSource,
+    endpointErrors,
+    nestedLineCount,
+    narrowListTried,
+    skipBuiltinLineApis,
+    target
+  };
+}
+
 async function handleApi(req, res, urlObj) {
   const pathname = urlObj.pathname;
   const db = readDb();
@@ -1393,7 +2883,7 @@ async function handleApi(req, res, urlObj) {
       if (!approver) throw new Error("담당자명 인증이 필요합니다.");
       if (approver !== "박유정") throw new Error("창고 삭제 권한은 박유정에게만 있습니다.");
       if (!db.managers.includes(approver)) throw new Error("등록된 담당자만 삭제할 수 있습니다.");
-      if (name === "툴스피아") throw new Error("기본 창고(툴스피아)는 삭제할 수 없습니다.");
+      if (name === "유통사업부") throw new Error("기본 창고(유통사업부)는 삭제할 수 없습니다.");
       const stocks = calculateStock(db, name);
       const hasRemaining = stocks.some((s) => Number(s.stock || 0) !== 0);
       if (hasRemaining) {
@@ -1597,11 +3087,33 @@ async function handleApi(req, res, urlObj) {
   if (req.method === "GET" && pathname === "/api/history") {
     const q = String(urlObj.searchParams.get("q") || "").toLowerCase();
     const stockAfter = computeStockAfterEachMovement(db);
+    const sourceToCenterMergedSlipMap = new Map();
+    const confirmedLists = db.outboundOrderUpload && db.outboundOrderUpload.confirmedLists;
+    if (confirmedLists && typeof confirmedLists === "object") {
+      for (const recMap of Object.values(confirmedLists)) {
+        if (!recMap || typeof recMap !== "object") continue;
+        for (const rec of Object.values(recMap)) {
+          if (!rec || typeof rec !== "object") continue;
+          const centerMergedSlipNo = String(rec.key || "").trim();
+          if (!centerMergedSlipNo) continue;
+          const lines = Array.isArray(rec.lines) ? rec.lines : [];
+          for (const ln of lines) {
+            const source = normalizeSlipNoText(String((ln && (ln.sourceSlipNo || ln.slipNo)) || "").trim());
+            if (!source) continue;
+            if (!sourceToCenterMergedSlipMap.has(source)) sourceToCenterMergedSlipMap.set(source, centerMergedSlipNo);
+          }
+        }
+      }
+    }
     const joined = db.movements
       .map((m) => {
         const p = db.products.find((x) => x.code === m.productCode);
+        const rawSlipNo = String(m.slipNo || "").trim();
+        const mappedCenterSlip = sourceToCenterMergedSlipMap.get(normalizeSlipNoText(rawSlipNo)) || "";
+        const slipNoDisplay = mappedCenterSlip || rawSlipNo;
         return {
           ...m,
+          slipNoDisplay,
           productName: p ? p.name : "",
           ecountCode: p ? p.ecountCode || "" : "",
           stockAfter: stockAfter[m.id] ?? 0
@@ -1616,7 +3128,23 @@ async function handleApi(req, res, urlObj) {
         );
       })
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    return sendJson(res, 200, { items: joined });
+    const outSlipTotals = new Map();
+    for (const x of joined) {
+      if (x.type !== "OUT") continue;
+      const slip = String(x.slipNoDisplay || "").trim();
+      if (!slip) continue;
+      outSlipTotals.set(slip, (outSlipTotals.get(slip) || 0) + Math.abs(Number(x.qty || 0)));
+    }
+    const items = joined.map((x) => {
+      if (x.type !== "OUT") return x;
+      const slip = String(x.slipNoDisplay || "").trim();
+      if (!slip) return x;
+      return {
+        ...x,
+        qtyDisplay: outSlipTotals.get(slip) ?? Math.abs(Number(x.qty || 0))
+      };
+    });
+    return sendJson(res, 200, { items });
   }
 
   if (req.method === "GET" && pathname === "/api/recent") {
@@ -1626,20 +3154,718 @@ async function handleApi(req, res, urlObj) {
       return sendJson(res, 400, { error: "유효하지 않은 조회 타입입니다." });
     }
     const stockAfter = computeStockAfterEachMovement(db);
-    const items = db.movements
+    if (type === "IN") {
+      const cancelledSlipSet = new Set(
+        db.movements
+          .filter(
+            (m) =>
+              m &&
+              m.type === "ADJUST" &&
+              !m.cancelled &&
+              String(m.memo || "").includes("입고확정 취소 원복") &&
+              String(m.slipNo || "").trim()
+          )
+          .map((m) => normalizeSlipNoText(m.slipNo))
+          .filter(Boolean)
+      );
+      const items = db.movements
+        .filter((m) => m.type === "IN" && !m.cancelled)
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+        .slice(0, limit)
+        .map((m) => {
+          const p = db.products.find((x) => x.code === m.productCode);
+          const slipKey = normalizeSlipNoText(m.slipNo);
+          return {
+            ...m,
+            slipConfirm: false,
+            slipCancelled: Boolean(slipKey && cancelledSlipSet.has(slipKey)),
+            productName: p ? p.name : "",
+            ecountCode: p ? p.ecountCode || "" : "",
+            stockAfter: stockAfter[m.id] ?? 0
+          };
+        });
+      return sendJson(res, 200, { items });
+    }
+    const sourceToCenterMergedSlipMap = new Map();
+    const confirmedLists = db.outboundOrderUpload && db.outboundOrderUpload.confirmedLists;
+    if (confirmedLists && typeof confirmedLists === "object") {
+      for (const recMap of Object.values(confirmedLists)) {
+        if (!recMap || typeof recMap !== "object") continue;
+        for (const rec of Object.values(recMap)) {
+          if (!rec || typeof rec !== "object") continue;
+          const centerMergedSlipNo = String(rec.key || "").trim();
+          if (!centerMergedSlipNo) continue;
+          const lines = Array.isArray(rec.lines) ? rec.lines : [];
+          for (const ln of lines) {
+            const source = normalizeSlipNoText(String((ln && (ln.sourceSlipNo || ln.slipNo)) || "").trim());
+            if (!source) continue;
+            if (!sourceToCenterMergedSlipMap.has(source)) sourceToCenterMergedSlipMap.set(source, centerMergedSlipNo);
+          }
+        }
+      }
+    }
+    const itemsRaw = db.movements
       .filter((m) => m.type === type && !m.cancelled)
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .slice(0, limit)
       .map((m) => {
         const p = db.products.find((x) => x.code === m.productCode);
+        const rawSlipNo = String(m.slipNo || "").trim();
+        const mappedCenterSlip = sourceToCenterMergedSlipMap.get(normalizeSlipNoText(rawSlipNo)) || "";
+        const slipNoDisplay = mappedCenterSlip || rawSlipNo;
         return {
           ...m,
+          slipNoDisplay,
+          slipConfirm: false,
           productName: p ? p.name : "",
           ecountCode: p ? p.ecountCode || "" : "",
           stockAfter: stockAfter[m.id] ?? 0
         };
       });
+    const outSlipTotals = new Map();
+    for (const x of itemsRaw) {
+      const slip = String(x.slipNoDisplay || "").trim();
+      if (!slip) continue;
+      outSlipTotals.set(slip, (outSlipTotals.get(slip) || 0) + Math.abs(Number(x.qty || 0)));
+    }
+    const items = itemsRaw.map((x) => {
+      const slip = String(x.slipNoDisplay || "").trim();
+      if (!slip) return x;
+      return {
+        ...x,
+        qtyDisplay: outSlipTotals.get(slip) ?? Math.abs(Number(x.qty || 0))
+      };
+    });
     return sendJson(res, 200, { items });
+  }
+
+  /* 판매처별 출고 발주 업로드 */
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      const sourceFileName = String(body.sourceFileName || "").trim().slice(0, 240);
+      let matrix = [];
+      if (Array.isArray(body.matrix) && body.matrix.length) {
+        matrix = body.matrix;
+      } else if (body.sheetBase64) {
+        const buf = Buffer.from(String(body.sheetBase64), "base64");
+        const wb = XLSX.read(buf, { type: "buffer" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+      } else {
+        throw new Error("matrix 또는 sheetBase64가 필요합니다.");
+      }
+      const uploadBatchId = `OUT-${Date.now()}`;
+      const { okRows, errorRows } = parseOutboundOrderRowsByPartner(matrix, partnerType, uploadBatchId, sourceFileName, db);
+      db.outboundOrderUpload.uploadedRows = [...(db.outboundOrderUpload.uploadedRows || []), ...okRows];
+      db.outboundOrderUpload.batches = [
+        {
+          uploadBatchId,
+          partnerType,
+          partner: partnerLabelFromType(partnerType),
+          sourceFileName,
+          parserVersion: OUTBOUND_PARTNER_ADAPTERS[partnerType].parserVersion,
+          okCount: okRows.length,
+          errorCount: errorRows.length,
+          uploadedAt: new Date().toISOString()
+        },
+        ...(db.outboundOrderUpload.batches || [])
+      ].slice(0, 120);
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      const items = aggregateOutboundUploadSlips(db.outboundOrderUpload.lines || [], db.outboundOrderUpload.slipWorkflow || {}, partnerType);
+      return sendJson(res, 200, {
+        ok: true,
+        uploadBatchId,
+        items,
+        okCount: okRows.length,
+        errorRows,
+        needsApply: true
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    const items = aggregateOutboundUploadSlips(
+      db.outboundOrderUpload.lines || [],
+      db.outboundOrderUpload.slipWorkflow || {},
+      partnerType
+    );
+    const batches = (db.outboundOrderUpload.batches || []).filter((x) => x.partnerType === partnerType).slice(0, 30);
+    const appliedBatchId = String((db.outboundOrderUpload.appliedBatchByPartner || {})[partnerType] || "").trim();
+    return sendJson(res, 200, { items, batches, appliedBatchId, uploadedAt: db.outboundOrderUpload.uploadedAt || "" });
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/apply-batch") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      const uploadBatchId = String(body.uploadBatchId || "").trim();
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      if (!uploadBatchId) throw new Error("적용할 uploadBatchId가 필요합니다.");
+
+      const targetRows = (db.outboundOrderUpload.uploadedRows || []).filter(
+        (row) => row.partnerType === partnerType && String(row.uploadBatchId || "").trim() === uploadBatchId
+      );
+      if (!targetRows.length) throw new Error("선택한 업로드 파일의 데이터가 없습니다.");
+
+      db.outboundOrderUpload.lines = (db.outboundOrderUpload.lines || []).filter((row) => row.partnerType !== partnerType);
+      db.outboundOrderUpload.lines.push(...targetRows);
+
+      // 적용 파일이 바뀌면 해당 판매처 워크플로우/확정리스트를 초기화한다.
+      const aliveKeys = new Set(targetRows.map((x) => normalizeSlipNoText(x.slipNo)).filter(Boolean));
+      const wf = db.outboundOrderUpload.slipWorkflow || {};
+      for (const k of Object.keys(wf)) {
+        if (!aliveKeys.has(k)) delete wf[k];
+      }
+      db.outboundOrderUpload.slipWorkflow = wf;
+      db.outboundOrderUpload.confirmedLists = db.outboundOrderUpload.confirmedLists || {};
+      db.outboundOrderUpload.confirmedLists[partnerType] = {};
+
+      db.outboundOrderUpload.appliedBatchByPartner = db.outboundOrderUpload.appliedBatchByPartner || {};
+      db.outboundOrderUpload.appliedBatchByPartner[partnerType] = uploadBatchId;
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+
+      const items = aggregateOutboundUploadSlips(db.outboundOrderUpload.lines || [], db.outboundOrderUpload.slipWorkflow || {}, partnerType);
+      return sendJson(res, 200, { ok: true, appliedBatchId: uploadBatchId, items, appliedCount: targetRows.length });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/delete") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      const all = Boolean(body.all);
+      const keys = new Set(
+        (Array.isArray(body.slipNos) ? body.slipNos : [])
+          .map((x) => normalizeSlipNoText(x))
+          .filter(Boolean)
+      );
+      if (!all && !keys.size) throw new Error("삭제할 전표번호가 없습니다.");
+
+      const before = db.outboundOrderUpload.lines || [];
+      const keep = before.filter((row) => {
+        if (row.partnerType !== partnerType) return true;
+        if (all) return false;
+        return !keys.has(normalizeSlipNoText(row.slipNo));
+      });
+      const deletedLineCount = before.length - keep.length;
+      db.outboundOrderUpload.lines = keep;
+
+      const wf = db.outboundOrderUpload.slipWorkflow || {};
+      if (all) {
+        for (const k of Object.keys(wf)) {
+          const row = before.find((x) => normalizeSlipNoText(x.slipNo) === k);
+          if (row && row.partnerType === partnerType) delete wf[k];
+        }
+      } else {
+        for (const k of keys) delete wf[k];
+      }
+      db.outboundOrderUpload.slipWorkflow = wf;
+
+      if (all) {
+        db.outboundOrderUpload.uploadedRows = (db.outboundOrderUpload.uploadedRows || []).filter((x) => x.partnerType !== partnerType);
+        db.outboundOrderUpload.batches = (db.outboundOrderUpload.batches || []).filter((x) => x.partnerType !== partnerType);
+        if (db.outboundOrderUpload.appliedBatchByPartner) delete db.outboundOrderUpload.appliedBatchByPartner[partnerType];
+        db.outboundOrderUpload.confirmedLists = db.outboundOrderUpload.confirmedLists || {};
+        db.outboundOrderUpload.confirmedLists[partnerType] = {};
+      }
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+
+      const items = aggregateOutboundUploadSlips(
+        db.outboundOrderUpload.lines || [],
+        db.outboundOrderUpload.slipWorkflow || {},
+        partnerType
+      );
+      return sendJson(res, 200, { ok: true, deletedLineCount, items });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/delete-batches") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      const batchIds = new Set((Array.isArray(body.uploadBatchIds) ? body.uploadBatchIds : []).map((x) => String(x || "").trim()).filter(Boolean));
+      if (!batchIds.size) throw new Error("삭제할 업로드 배치가 없습니다.");
+
+      const beforeUploaded = db.outboundOrderUpload.uploadedRows || [];
+      db.outboundOrderUpload.uploadedRows = beforeUploaded.filter(
+        (row) => !(row.partnerType === partnerType && batchIds.has(String(row.uploadBatchId || "").trim()))
+      );
+      const deletedLineCount = beforeUploaded.length - db.outboundOrderUpload.uploadedRows.length;
+
+      const beforeActive = db.outboundOrderUpload.lines || [];
+      db.outboundOrderUpload.lines = beforeActive.filter(
+        (row) => !(row.partnerType === partnerType && batchIds.has(String(row.uploadBatchId || "").trim()))
+      );
+
+      db.outboundOrderUpload.batches = (db.outboundOrderUpload.batches || []).filter(
+        (b) => !(b.partnerType === partnerType && batchIds.has(String(b.uploadBatchId || "").trim()))
+      );
+
+      const aliveSlipSet = new Set(
+        (db.outboundOrderUpload.lines || [])
+          .filter((x) => x.partnerType === partnerType)
+          .map((x) => normalizeSlipNoText(x.slipNo))
+          .filter(Boolean)
+      );
+      for (const k of Object.keys(db.outboundOrderUpload.slipWorkflow || {})) {
+        if (!aliveSlipSet.has(k)) delete db.outboundOrderUpload.slipWorkflow[k];
+      }
+
+      const appliedMap = db.outboundOrderUpload.appliedBatchByPartner || {};
+      const appliedId = String(appliedMap[partnerType] || "").trim();
+      if (appliedId && batchIds.has(appliedId)) {
+        delete appliedMap[partnerType];
+        db.outboundOrderUpload.confirmedLists = db.outboundOrderUpload.confirmedLists || {};
+        db.outboundOrderUpload.confirmedLists[partnerType] = {};
+      }
+
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      return sendJson(res, 200, { ok: true, deletedLineCount });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/lines") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    const centerTab = String(urlObj.searchParams.get("centerTab") || "all").trim();
+    const baseRows = (db.outboundOrderUpload.lines || []).filter((x) => x.partnerType === partnerType);
+    const counts =
+      partnerType === "emart"
+        ? {
+            all: baseRows.length,
+            여주: baseRows.filter((x) => resolveCenterBucket(x) === "여주").length,
+            대구: baseRows.filter((x) => resolveCenterBucket(x) === "대구").length,
+            시화: baseRows.filter((x) => resolveCenterBucket(x) === "시화").length
+          }
+        : { all: baseRows.length };
+    let rows = baseRows;
+    if (partnerType === "emart" && centerTab !== "all") {
+      rows = rows.filter((x) => resolveCenterBucket(x) === centerTab);
+    }
+    return sendJson(res, 200, { items: rows, counts });
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/unship-lines") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    const centerTab = String(urlObj.searchParams.get("centerTab") || "all").trim();
+    const baseRows = (db.outboundOrderUpload.lines || []).filter(
+      (x) => x.partnerType === partnerType && String(x.unshipStatus || "").trim() === "미출"
+    );
+    const counts =
+      partnerType === "emart"
+        ? {
+            all: baseRows.length,
+            여주: baseRows.filter((x) => resolveCenterBucket(x) === "여주").length,
+            대구: baseRows.filter((x) => resolveCenterBucket(x) === "대구").length,
+            시화: baseRows.filter((x) => resolveCenterBucket(x) === "시화").length
+          }
+        : { all: baseRows.length };
+    let rows = baseRows;
+    if (partnerType === "emart" && centerTab !== "all") {
+      rows = rows.filter((x) => resolveCenterBucket(x) === centerTab);
+    }
+    const items = rows.map((x) => ({
+      slipNo: x.slipNo || "",
+      dueDate: x.dueDate || "",
+      storeInDate: x.storeInDate || "",
+      poDate: x.poDate || "",
+      orderDate: x.orderDate || "",
+      centerName: x.centerName || "",
+      centerCode: x.centerCode || "",
+      storeName: x.storeName || "",
+      productCode: x.productCode || "",
+      sourceProductCode: x.sourceProductCode || "",
+      productName: x.productName || "",
+      orderQty: x.orderQty,
+      fixedQty: x.fixedQty != null && String(x.fixedQty).trim() !== "" ? x.fixedQty : 0,
+      lot: x.lot || "",
+      warehouse: x.warehouse || "",
+      uploadBatchId: x.uploadBatchId || "",
+      sourceRowNo: x.sourceRowNo
+    }));
+    return sendJson(res, 200, { items, counts });
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/lines/update") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      const updatesRaw = Array.isArray(body.updates) ? body.updates : [];
+      const updates = updatesRaw
+        .map((x) => {
+          const uploadBatchId = String(x?.uploadBatchId || "").trim();
+          const sourceRowNoRaw = Number(x?.sourceRowNo);
+          const sourceRowNo = Number.isFinite(sourceRowNoRaw) ? Math.trunc(sourceRowNoRaw) : NaN;
+          const status = String(x?.unshipStatus || "").trim() === "미출" ? "미출" : "정상";
+          let fixedQtyRaw = Number(String(x?.fixedQty ?? "").replace(/,/g, "").trim());
+          if (!Number.isFinite(fixedQtyRaw)) fixedQtyRaw = 0;
+          const fixedQty = Math.max(0, Math.trunc(fixedQtyRaw));
+          if (!uploadBatchId || !Number.isFinite(sourceRowNo) || sourceRowNo <= 0) return null;
+          return { uploadBatchId, sourceRowNo, unshipStatus: status, fixedQty };
+        })
+        .filter(Boolean);
+      if (!updates.length) throw new Error("저장할 라인 변경값이 없습니다.");
+
+      const updateMap = new Map(updates.map((u) => [`${u.uploadBatchId}|${u.sourceRowNo}`, u]));
+      let changedCount = 0;
+      db.outboundOrderUpload.lines = (db.outboundOrderUpload.lines || []).map((row) => {
+        if (!row || row.partnerType !== partnerType) return row;
+        const key = `${String(row.uploadBatchId || "").trim()}|${Number(row.sourceRowNo)}`;
+        const next = updateMap.get(key);
+        if (!next) return row;
+        changedCount += 1;
+        return {
+          ...row,
+          unshipStatus: next.unshipStatus,
+          fixedQty: String(next.fixedQty)
+        };
+      });
+
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      return sendJson(res, 200, { ok: true, changedCount });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-code-master") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    const items = (db.outboundCodeMasters || []).filter((x) => x.partnerType === partnerType).slice(0, 2000);
+    return sendJson(res, 200, { items });
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-code-master/upload") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType);
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      let matrix = [];
+      if (Array.isArray(body.matrix) && body.matrix.length) matrix = body.matrix;
+      else if (body.sheetBase64) {
+        const buf = Buffer.from(String(body.sheetBase64), "base64");
+        const wb = XLSX.read(buf, { type: "buffer" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+      } else throw new Error("matrix 또는 sheetBase64가 필요합니다.");
+
+      const sourceFileName = String(body.sourceFileName || "").trim().slice(0, 240);
+      const { items, errorRows } = parseOutboundCodeMasterRows(matrix, partnerType, sourceFileName);
+      const keep = (db.outboundCodeMasters || []).filter((x) => x.partnerType !== partnerType);
+      const merged = new Map();
+      for (const x of items) merged.set(String(x.sourceCode), x);
+      db.outboundCodeMasters = [...keep, ...Array.from(merged.values())];
+      writeDb(db);
+      return sendJson(res, 200, { ok: true, count: items.length, errorRows });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/template") {
+    try {
+      const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      const headers = OUTBOUND_PARTNER_TEMPLATE_HEADERS[partnerType];
+      if (!Array.isArray(headers) || !headers.length) throw new Error("템플릿 헤더를 찾지 못했습니다.");
+      const sampleOrderNo =
+        partnerType === "daiso" ? "DS-ORDER-001" : partnerType === "emart" ? "EM-ORDER-001" : "LT-ORDER-001";
+      const sampleRow = [
+        sampleOrderNo,
+        "2026-04-27",
+        "2026-04-30",
+        "SAMPLE-001",
+        "샘플상품",
+        10,
+        "유통사업부",
+        "샘플 비고"
+      ];
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.aoa_to_sheet([headers, sampleRow]);
+      XLSX.utils.book_append_sheet(wb, ws, "template");
+      const out = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const filename = `outbound-upload-template-${partnerType}.xlsx`;
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": Buffer.byteLength(out)
+      });
+      return res.end(out);
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/detail") {
+    const slipNo = String(urlObj.searchParams.get("slipNo") || "").trim();
+    if (!slipNo) return sendJson(res, 400, { error: "slipNo가 필요합니다." });
+    const key = normalizeSlipNoText(slipNo);
+    const detailLines = outboundUploadLinesToDetailRows(db.outboundOrderUpload.lines || [], key);
+    if (!detailLines.length) return sendJson(res, 200, { item: null, items: [], workflow: { status: "draft", lineQtyByIndex: {} } });
+    const wf =
+      (db.outboundOrderUpload.slipWorkflow && db.outboundOrderUpload.slipWorkflow[key]) || { status: "draft", lineQtyByIndex: {} };
+    const qMap = wf.lineQtyByIndex && typeof wf.lineQtyByIndex === "object" ? wf.lineQtyByIndex : {};
+    const items = detailLines.map((x, idx) => ({
+      ...x,
+      confirmQty: qMap[String(idx)] != null ? qMap[String(idx)] : x.orderQty
+    }));
+    return sendJson(res, 200, {
+      item: items[0],
+      items,
+      workflow: {
+        status: wf.status || "draft",
+        lineQtyByIndex: qMap,
+        confirmedAt: wf.confirmedAt || null,
+        sentAt: wf.sentAt || null
+      }
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/workflow") {
+    try {
+      const body = await parseBody(req);
+      const slipNo = String(body.slipNo || "").trim();
+      const action = String(body.action || "").trim();
+      if (!slipNo) throw new Error("slipNo가 필요합니다.");
+      const key = normalizeSlipNoText(slipNo);
+      const group = outboundUploadLinesToDetailRows(db.outboundOrderUpload.lines || [], key);
+      if (!group.length) throw new Error("해당 전표의 품목 행이 없습니다.");
+      const wfPrev = db.outboundOrderUpload.slipWorkflow[key] || { status: "draft", lineQtyByIndex: {} };
+      const bodyLineQtyByIndex = body.lineQtyByIndex && typeof body.lineQtyByIndex === "object" ? body.lineQtyByIndex : {};
+
+      if (action === "save-check") {
+        const qMerged = mergeLineQtyByIndexFromBody(bodyLineQtyByIndex, group.map((x) => ({ qty: x.orderQty })));
+        db.outboundOrderUpload.slipWorkflow[key] = { ...wfPrev, status: "draft", lineQtyByIndex: qMerged, confirmedAt: undefined };
+      } else if (action === "confirm") {
+        applyOutboundWorkflowConfirm(db, slipNo, String(body.stockUser || "").trim(), body.lineQtyByIndex);
+      } else if (action === "reopen") {
+        performOutboundWorkflowReopen(db, slipNo);
+      } else if (action === "send-sales") {
+        if (wfPrev.status !== "confirmed") throw new Error("출고확정 후에 판매입력을 전송할 수 있습니다.");
+        const enabled = String(process.env.ECOUNT_TEST_SAVE_SALES ?? "").trim().toLowerCase();
+        if (!["1", "true", "yes", "on"].includes(enabled)) {
+          throw new Error("비활성화됨. 테스트 시 .env에 ECOUNT_TEST_SAVE_SALES=1 후 서버 재시작하세요.");
+        }
+        const ptype = String(group[0]?.partnerType || "").trim();
+        if (!ptype) throw new Error("판매처(partnerType)를 찾을 수 없습니다.");
+        const listKey = findOutboundConfirmListKeyForSlip(db, ptype, slipNo);
+        if (!listKey) {
+          throw new Error("확정리스트에 해당 전표 묶음이 없습니다. 확정리스트 탭에서 판매입력을 실행하세요.");
+        }
+        const ecountOut = await runOutboundConfirmListSalesToEcount(db, ptype, listKey);
+        return sendJson(res, 200, {
+          ok: true,
+          workflow: db.outboundOrderUpload.slipWorkflow[key],
+          ecount: ecountOut
+        });
+      } else {
+        throw new Error("action은 save-check, confirm, reopen, send-sales 중 하나여야 합니다.");
+      }
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      return sendJson(res, 200, { ok: true, workflow: db.outboundOrderUpload.slipWorkflow[key] });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/workflow/bulk-confirm") {
+    try {
+      const body = await parseBody(req);
+      const stockUser = String(body.stockUser || "").trim();
+      const slipNosRaw = Array.isArray(body.slipNos) ? body.slipNos : [];
+      if (!stockUser) throw new Error("출고 담당자(stockUser)가 필요합니다.");
+      const slipByNorm = new Map();
+      for (const s of slipNosRaw) {
+        const slipOne = String(s || "").trim();
+        if (!slipOne) continue;
+        const n = normalizeSlipNoText(slipOne);
+        if (!n) continue;
+        if (!slipByNorm.has(n)) slipByNorm.set(n, slipOne);
+      }
+      const slipNos = [...slipByNorm.values()];
+      if (!slipNos.length) throw new Error("확정할 전표(slipNos)가 없습니다.");
+      if (!db.managers.includes(stockUser)) throw new Error("출고 담당자를 선택하세요.");
+
+      const dbWork = JSON.parse(JSON.stringify(db));
+      for (const slipNo of slipNos) {
+        try {
+          applyOutboundWorkflowConfirm(dbWork, slipNo, stockUser, undefined);
+        } catch (e) {
+          throw new Error(`${slipNo}: ${e.message || e}`);
+        }
+      }
+      dbWork.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(dbWork);
+      return sendJson(res, 200, { ok: true, count: slipNos.length });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/confirm-list/detail") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    const listKey = String(urlObj.searchParams.get("listKey") || "").trim();
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    if (!listKey) return sendJson(res, 400, { error: "listKey가 필요합니다." });
+    const recMap = db.outboundOrderUpload.confirmedLists && db.outboundOrderUpload.confirmedLists[partnerType];
+    if (!recMap || typeof recMap !== "object") {
+      return sendJson(res, 404, { error: "확정 저장 내역이 없습니다." });
+    }
+    const record = recMap[listKey];
+    if (!record) return sendJson(res, 404, { error: "해당 키의 확정 내역을 찾을 수 없습니다." });
+    const slipNos = Array.isArray(record.slipNos) ? record.slipNos.map((s) => String(s || "").trim()).filter(Boolean) : [];
+    const lines = Array.isArray(record.lines)
+      ? record.lines.map((ln) => ({
+          slipNo: String(ln.slipNo || "").trim(),
+          sourceSlipNo: String(ln.sourceSlipNo || "").trim(),
+          productCode: String(ln.productCode || "").trim(),
+          productName: String(ln.productName || "").trim(),
+          qty: ln.qty != null ? ln.qty : "",
+          warehouse: String(ln.warehouse || "").trim(),
+          lot: String(ln.lot || "").trim(),
+          orderQty: String(ln.orderQty || "").trim(),
+          fixedQty: String(ln.fixedQty || "").trim(),
+          unshipStatus: String(ln.unshipStatus || "").trim()
+        }))
+      : [];
+    return sendJson(res, 200, {
+      item: {
+        key: record.key || listKey,
+        centerMergedSlipNo: record.key || listKey,
+        partnerType: record.partnerType || partnerType,
+        centerName: record.centerName || "",
+        saveDateYmd: record.saveDateYmd || "",
+        storeInDateYmd: record.storeInDateYmd || "",
+        updatedAt: record.updatedAt || "",
+        slipNos,
+        lines
+      }
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/api/outbound-order-upload/confirm-list") {
+    const partnerType = normalizeOutboundPartnerType(urlObj.searchParams.get("partnerType") || "");
+    if (!partnerType) return sendJson(res, 400, { error: "partnerType(daiso/emart/lotte)가 필요합니다." });
+    const recMap = db.outboundOrderUpload.confirmedLists && db.outboundOrderUpload.confirmedLists[partnerType];
+    if (!recMap || typeof recMap !== "object") {
+      return sendJson(res, 200, { items: [] });
+    }
+    const items = Object.values(recMap)
+      .filter((x) => x && x.key)
+      .map((x) => {
+        const slipKeys = Array.isArray(x.slipNos)
+          ? [...new Set(x.slipNos.map((s) => normalizeSlipNoText(String(s || ""))).filter(Boolean))]
+          : [];
+        const sentCount = slipKeys.filter((sk) => {
+          const wf = db.outboundOrderUpload.slipWorkflow && db.outboundOrderUpload.slipWorkflow[sk];
+          return Boolean(wf && wf.sentAt);
+        }).length;
+        return {
+          key: x.key,
+          centerMergedSlipNo: x.key,
+          centerName: x.centerName || "",
+          saveDateYmd: x.saveDateYmd || "",
+          storeInDateYmd: x.storeInDateYmd || "",
+          slipCount: Array.isArray(x.slipNos) ? x.slipNos.length : 0,
+          lineCount: Array.isArray(x.lines) ? x.lines.length : 0,
+          productCount: (() => {
+            const set = new Set(
+              (Array.isArray(x.lines) ? x.lines : [])
+                .map((ln) => String((ln && ln.productCode) || "").trim())
+                .filter(Boolean)
+            );
+            return set.size;
+          })(),
+          totalQty: (Array.isArray(x.lines) ? x.lines : []).reduce((sum, ln) => {
+            const n = Number((ln && ln.qty) ?? 0);
+            return sum + (Number.isFinite(n) ? n : 0);
+          }, 0),
+          sentCount,
+          allSent: slipKeys.length > 0 && sentCount === slipKeys.length,
+          updatedAt: x.updatedAt || ""
+        };
+      })
+      .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+    return sendJson(res, 200, { items });
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/confirm-list/send-sales") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType || "");
+      const listKey = String(body.listKey || "").trim();
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      if (!listKey) throw new Error("확정리스트 키(listKey)가 필요합니다.");
+
+      const enabled = String(process.env.ECOUNT_TEST_SAVE_SALES ?? "").trim().toLowerCase();
+      if (!["1", "true", "yes", "on"].includes(enabled)) {
+        throw new Error("비활성화됨. 테스트 시 .env에 ECOUNT_TEST_SAVE_SALES=1 후 서버 재시작하세요.");
+      }
+
+      const out = await runOutboundConfirmListSalesToEcount(db, partnerType, listKey);
+      return sendJson(res, 200, out);
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/api/outbound-order-upload/confirm-list/cancel") {
+    try {
+      const body = await parseBody(req);
+      const partnerType = normalizeOutboundPartnerType(body.partnerType || "");
+      const listKey = String(body.listKey || "").trim();
+      if (!partnerType) throw new Error("partnerType(daiso/emart/lotte)가 필요합니다.");
+      if (!listKey) throw new Error("확정리스트 키(listKey)가 필요합니다.");
+      db.outboundOrderUpload.confirmedLists = db.outboundOrderUpload.confirmedLists || {};
+      db.outboundOrderUpload.confirmedLists[partnerType] = db.outboundOrderUpload.confirmedLists[partnerType] || {};
+      const recMap = db.outboundOrderUpload.confirmedLists[partnerType];
+      const record = recMap[listKey];
+      if (!record) throw new Error("해당 확정 저장 내역을 찾을 수 없습니다.");
+
+      const slipKeys = Array.isArray(record.slipNos)
+        ? [...new Set(record.slipNos.map((s) => normalizeSlipNoText(String(s || ""))).filter(Boolean))]
+        : [];
+
+      for (const sk of slipKeys) {
+        const wf = db.outboundOrderUpload.slipWorkflow[sk] || {};
+        if (wf.sentAt) throw new Error(`판매입력 전송이 완료된 전표가 포함되어 있어 취소할 수 없습니다: ${sk}`);
+      }
+
+      for (const sk of slipKeys) {
+        const wf = db.outboundOrderUpload.slipWorkflow[sk] || {};
+        if (wf.status === "confirmed") performOutboundWorkflowReopen(db, sk);
+      }
+
+      delete recMap[listKey];
+      db.outboundOrderUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      return sendJson(res, 200, { ok: true, reopenedSlips: slipKeys.length });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
   }
 
   /*
@@ -1681,7 +3907,7 @@ async function handleApi(req, res, urlObj) {
       db.inboundPlanUpload.sourceFileName = sourceFileName || db.inboundPlanUpload.sourceFileName || "upload.xlsx";
       db.inboundPlanUpload.uploadedAt = new Date().toISOString();
       writeDb(db);
-      const items = aggregateInboundPlanUploadLines(merged);
+      const items = aggregateInboundPlanUploadLines(merged, db.inboundPlanUpload.slipWorkflow || {});
       return sendJson(res, 200, {
         ok: true,
         lineCount: merged.length,
@@ -1702,7 +3928,7 @@ async function handleApi(req, res, urlObj) {
 
   if (req.method === "GET" && pathname === "/api/inbound-plan-upload") {
     const lines = db.inboundPlanUpload.lines || [];
-    const items = aggregateInboundPlanUploadLines(lines);
+    const items = aggregateInboundPlanUploadLines(lines, db.inboundPlanUpload.slipWorkflow || {});
     return sendJson(res, 200, {
       items,
       lineCount: lines.length,
@@ -1732,8 +3958,12 @@ async function handleApi(req, res, urlObj) {
       }
       db.inboundPlanUpload.lines = remain;
       db.inboundPlanUpload.uploadedAt = new Date().toISOString();
+      const wf = db.inboundPlanUpload.slipWorkflow;
+      if (wf && typeof wf === "object") {
+        for (const k of keys) delete wf[k];
+      }
       writeDb(db);
-      const items = aggregateInboundPlanUploadLines(remain);
+      const items = aggregateInboundPlanUploadLines(remain, db.inboundPlanUpload.slipWorkflow || {});
       return sendJson(res, 200, {
         ok: true,
         deletedSlipCount,
@@ -1765,13 +3995,265 @@ async function handleApi(req, res, urlObj) {
     const lines = db.inboundPlanUpload.lines || [];
     const detailLines = inboundPlanUploadLinesToDetailRows(lines, key);
     if (!detailLines.length) {
-      return sendJson(res, 200, { item: null, items: [], source: "upload" });
+      return sendJson(res, 200, { item: null, items: [], source: "upload", workflow: { status: "draft", lineQtyByIndex: {} } });
     }
-    return sendJson(res, 200, {
-      item: detailLines[0],
-      items: detailLines,
-      source: "upload"
+    const wf =
+      (db.inboundPlanUpload.slipWorkflow && db.inboundPlanUpload.slipWorkflow[key]) || {
+        status: "draft",
+        lineQtyByIndex: {}
+      };
+    const qMap = wf.lineQtyByIndex && typeof wf.lineQtyByIndex === "object" ? wf.lineQtyByIndex : {};
+    const itemsWithQty = detailLines.map((row, idx) => {
+      const orderQty = row.orderQty != null ? row.orderQty : row.qty;
+      const inboundCheckQty = qMap[String(idx)] != null ? qMap[String(idx)] : orderQty;
+      return { ...row, orderQty, inboundCheckQty };
     });
+    return sendJson(res, 200, {
+      item: itemsWithQty[0],
+      items: itemsWithQty,
+      source: "upload",
+      workflow: {
+        status: wf.status || "draft",
+        lineQtyByIndex: qMap,
+        confirmedAt: wf.confirmedAt || null,
+        ecountPurchaseSavedAt: wf.ecountPurchaseSavedAt || null,
+        wmsStockInboundAt: wf.wmsStockInboundAt || null
+      }
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/api/inbound-plan-upload/slip-workflow") {
+    try {
+      const body = await parseBody(req);
+      const slipNo = String(body.slipNo || "").trim();
+      const action = String(body.action || "").trim();
+      if (!slipNo) throw new Error("slipNo가 필요합니다.");
+      const key = normalizeSlipNoText(slipNo);
+      const group = getUploadSlipLineGroupSorted(db.inboundPlanUpload.lines || [], key);
+      if (!group.length) throw new Error("해당 전표의 품목 행이 없습니다.");
+
+      if (!db.inboundPlanUpload.slipWorkflow || typeof db.inboundPlanUpload.slipWorkflow !== "object") {
+        db.inboundPlanUpload.slipWorkflow = {};
+      }
+      const wfPrev = db.inboundPlanUpload.slipWorkflow[key] || { status: "draft", lineQtyByIndex: {} };
+      const prevQty =
+        wfPrev.lineQtyByIndex && typeof wfPrev.lineQtyByIndex === "object" ? wfPrev.lineQtyByIndex : {};
+
+      if (action === "save-qty") {
+        const merged = mergeLineQtyByIndexFromBody(body.lineQtyByIndex || {}, group);
+        db.inboundPlanUpload.slipWorkflow[key] = {
+          status: "draft",
+          lineQtyByIndex: merged,
+          confirmedAt: undefined,
+          ...slipWorkflowPreservePurchaseFlags(wfPrev)
+        };
+      } else if (action === "confirm") {
+        const merged = mergeLineQtyByIndexFromBody(body.lineQtyByIndex || {}, group);
+        for (let i = 0; i < group.length; i++) {
+          const n = Number(merged[String(i)]);
+          if (!Number.isFinite(n) || n <= 0) {
+            throw new Error(`입고 확정 불가: 행 ${i + 1} 입고확인 수량을 1 이상으로 입력하세요.`);
+          }
+        }
+        const stockUser = resolveInboundPlanStockUser(db, body, group);
+        assertUploadSlipWmsInboundReady(db, group, merged);
+        applyWmsStockInboundFromUploadSlip(db, group, merged, slipNo, stockUser);
+        db.inboundPlanUpload.slipWorkflow[key] = {
+          status: "confirmed",
+          lineQtyByIndex: merged,
+          confirmedAt: new Date().toISOString(),
+          stockUser,
+          ecountPurchaseSavedAt: wfPrev.ecountPurchaseSavedAt,
+          wmsStockInboundAt: new Date().toISOString()
+        };
+      } else if (action === "reopen") {
+        const allowReopenAfterEcountCancel = Boolean(body.allowReopenAfterEcountCancel);
+        if (wfPrev.ecountPurchaseSavedAt && !allowReopenAfterEcountCancel) {
+          throw new Error(
+            "이카운트 구매입력 이력이 있습니다. 이카운트 전표를 삭제했다면 확정 취소 시 '구매입력 전표 삭제 완료' 확인 후 다시 시도하세요."
+          );
+        }
+        if (wfPrev.wmsStockInboundAt) {
+          const stockUser = resolveInboundPlanRollbackUser(db, body, group, wfPrev);
+          rollbackWmsStockInboundFromUploadSlip(db, group, prevQty, slipNo, stockUser);
+        }
+        db.inboundPlanUpload.slipWorkflow[key] = {
+          ...wfPrev,
+          status: "draft",
+          lineQtyByIndex: { ...prevQty },
+          confirmedAt: undefined,
+          ecountPurchaseSavedAt: allowReopenAfterEcountCancel ? undefined : wfPrev.ecountPurchaseSavedAt,
+          wmsStockInboundAt: undefined
+        };
+      } else {
+        throw new Error("action은 save-qty, confirm, reopen 중 하나여야 합니다.");
+      }
+
+      db.inboundPlanUpload.uploadedAt = new Date().toISOString();
+      writeDb(db);
+      const next = db.inboundPlanUpload.slipWorkflow[key];
+      return sendJson(res, 200, { ok: true, workflow: next });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  /* 이카운트 구매입력(SavePurchases) 연결 테스트 — 실제 전표가 생성될 수 있음. ECOUNT_TEST_SAVE_PURCHASES=1 일 때만 허용. */
+  if (req.method === "POST" && pathname === "/api/ecount/test-save-purchases") {
+    try {
+      const enabled = String(process.env.ECOUNT_TEST_SAVE_PURCHASES ?? "").trim().toLowerCase();
+      if (!["1", "true", "yes", "on"].includes(enabled)) {
+        return sendJson(res, 403, {
+          error: "비활성화됨. 테스트 시 .env에 ECOUNT_TEST_SAVE_PURCHASES=1 후 서버 재시작하세요."
+        });
+      }
+      const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+      if (!comCode) throw new Error("ECOUNT_COM_CODE가 필요합니다.");
+      const payload = await parseBody(req);
+      if (!payload || typeof payload !== "object") throw new Error("JSON 본문이 필요합니다.");
+      if (!Array.isArray(payload.PurchasesList)) throw new Error("본문에 PurchasesList 배열이 필요합니다. (이카운트 SavePurchases와 동일 구조)");
+      const sessionId = await fetchEcountSession();
+      const apiBase = await fetchEcountApiBase(comCode);
+      const result = await postEcountOapiV2(apiBase, sessionId, "Purchases/SavePurchases", payload);
+      return sendJson(res, 200, {
+        ok: result.ok,
+        httpStatus: result.status,
+        ecount: result.data,
+        rawPreview: String(result.text || "").slice(0, 2000)
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  /*
+   * 발주서(slipNo) 조회 → PurchasesList 조립 → SavePurchases (ECOUNT_TEST_SAVE_PURCHASES=1 일 때만)
+   * 본문: { slipNo, from, to, dryRun?, ioDate?, custCd?, whCd? }
+   */
+  if (req.method === "POST" && pathname === "/api/ecount/save-purchases-from-order") {
+    try {
+      const enabled = String(process.env.ECOUNT_TEST_SAVE_PURCHASES ?? "").trim().toLowerCase();
+      if (!["1", "true", "yes", "on"].includes(enabled)) {
+        return sendJson(res, 403, {
+          error: "비활성화됨. 테스트 시 .env에 ECOUNT_TEST_SAVE_PURCHASES=1 후 서버 재시작하세요."
+        });
+      }
+      const body = await parseBody(req);
+      const slipNo = String(body.slipNo || "").trim();
+      const from = String(body.from || "").trim();
+      const to = String(body.to || "").trim();
+      const dryRun = Boolean(body.dryRun);
+      const ioDate = body.ioDate != null ? String(body.ioDate) : "";
+      const custCd = body.custCd != null ? String(body.custCd) : "";
+      const whCd = body.whCd != null ? String(body.whCd) : "";
+      if (!slipNo) throw new Error("slipNo(발주 전표번호)가 필요합니다.");
+      if (!from || !to) throw new Error("from, to(YYYY-MM-DD) 조회 기간이 필요합니다. 입고예정목록 1과 동일하게 넓게 잡으세요.");
+
+      const pack = await fetchEcountPurchaseOrderMatchedLines(slipNo, from, to);
+      if (!pack.matched.length) throw new Error("해당 기간에서 발주를 찾지 못했습니다. 기간·전표번호를 확인하세요.");
+
+      const purchasesPayload = buildSavePurchasesPayloadFromOrder(pack.headerRaw, pack.matched, {
+        ioDate,
+        custCd,
+        whCd
+      });
+
+      if (dryRun) {
+        return sendJson(res, 200, {
+          dryRun: true,
+          slipNo,
+          lineSource: pack.lineSourceFinal,
+          matchedLineCount: pack.matched.length,
+          purchasesPayload
+        });
+      }
+
+      const result = await postEcountOapiV2(
+        pack.apiBase,
+        pack.sessionId,
+        "Purchases/SavePurchases",
+        purchasesPayload
+      );
+      return sendJson(res, 200, {
+        ok: result.ok,
+        httpStatus: result.status,
+        ecount: result.data,
+        rawPreview: String(result.text || "").slice(0, 2000),
+        lineSource: pack.lineSourceFinal,
+        purchasesPayload
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
+  }
+
+  /** UI용: 구매입력(SavePurchases) 전송에 필요한 .env 준비 여부 (비밀값 노출 없음) */
+  if (req.method === "GET" && pathname === "/api/ecount/save-purchases-env") {
+    const enabled = String(process.env.ECOUNT_TEST_SAVE_PURCHASES ?? "").trim().toLowerCase();
+    const testSavePurchases = ["1", "true", "yes", "on"].includes(enabled);
+    const defaultWhCdConfigured = Boolean(String(process.env.ECOUNT_DEFAULT_WH_CD || "").trim());
+    const comCodeConfigured = Boolean(String(process.env.ECOUNT_COM_CODE || "").trim());
+    return sendJson(res, 200, { testSavePurchases, defaultWhCdConfigured, comCodeConfigured });
+  }
+
+  /*
+   * 입고예정목록 2 업로드 전표 — 입고 확정(slipWorkflow) 후 SavePurchases (ECOUNT_TEST_SAVE_PURCHASES=1)
+   * 본문: { slipNo }
+   */
+  if (req.method === "POST" && pathname === "/api/ecount/save-purchases-from-upload-slip") {
+    try {
+      const enabled = String(process.env.ECOUNT_TEST_SAVE_PURCHASES ?? "").trim().toLowerCase();
+      if (!["1", "true", "yes", "on"].includes(enabled)) {
+        return sendJson(res, 403, {
+          error: "비활성화됨. 테스트 시 .env에 ECOUNT_TEST_SAVE_PURCHASES=1 후 서버 재시작하세요."
+        });
+      }
+      const body = await parseBody(req);
+      const slipNo = String(body.slipNo || "").trim();
+      if (!slipNo) throw new Error("slipNo가 필요합니다.");
+      const key = normalizeSlipNoText(slipNo);
+      const wf = db.inboundPlanUpload.slipWorkflow && db.inboundPlanUpload.slipWorkflow[key];
+      if (!wf || wf.status !== "confirmed") {
+        throw new Error("입고 확정된 전표만 구매입력할 수 있습니다. 전표 상세에서 입고 확정을 먼저 하세요.");
+      }
+      const group = getUploadSlipLineGroupSorted(db.inboundPlanUpload.lines || [], key);
+      if (!group.length) throw new Error("품목 행이 없습니다.");
+      const lineQtyByIndex = wf.lineQtyByIndex && typeof wf.lineQtyByIndex === "object" ? wf.lineQtyByIndex : {};
+      const purchasesPayload = buildSavePurchasesPayloadFromUploadSlip(group, lineQtyByIndex);
+
+      if (wf.ecountPurchaseSavedAt) {
+        return sendJson(res, 200, {
+          ok: true,
+          alreadyComplete: true,
+          ecount: null,
+          purchasesPayload,
+          message: "이미 이카운트 구매입력이 완료된 전표입니다."
+        });
+      }
+
+      const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
+      if (!comCode) throw new Error("ECOUNT_COM_CODE가 필요합니다.");
+      const sessionId = await fetchEcountSession();
+      const apiBase = await fetchEcountApiBase(comCode);
+      const result = await postEcountOapiV2(apiBase, sessionId, "Purchases/SavePurchases", purchasesPayload);
+      if (!result.ok) {
+        throw new Error(
+          `이카운트 SavePurchases 실패(HTTP ${result.status}). ${String(result.text || "").slice(0, 500)}`
+        );
+      }
+      wf.ecountPurchaseSavedAt = new Date().toISOString();
+      writeDb(db);
+
+      return sendJson(res, 200, {
+        ok: true,
+        httpStatus: result.status,
+        ecount: result.data,
+        rawPreview: String(result.text || "").slice(0, 2000),
+        purchasesPayload
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
   }
 
   /*
@@ -1804,7 +4286,7 @@ async function handleApi(req, res, urlObj) {
             itemName: "샘플상품",
             qty: 120,
             dueDate: to || "2026-04-30",
-            whName: "툴스피아",
+            whName: "유통사업부",
             status: "발주완료"
           }
         ];
@@ -1910,231 +4392,19 @@ async function handleApi(req, res, urlObj) {
       const to = String(urlObj.searchParams.get("to") || "").trim();
       if (!slipNo) throw new Error("전표번호(slipNo)가 필요합니다.");
 
-      const comCode = String(process.env.ECOUNT_COM_CODE || "").trim();
-      const fromCompact = normalizeDateCompact(from);
-      const toCompact = normalizeDateCompact(to);
-      const baseDate = toCompact || fromCompact || normalizeDateCompact(new Date().toISOString().slice(0, 10));
-      const range = clampDateRangeToMax30Days(fromCompact || baseDate, toCompact || baseDate);
+      const pack = await fetchEcountPurchaseOrderMatchedLines(slipNo, from, to);
+      const {
+        matched,
+        headerRaw,
+        rawRows,
+        usedEndpoint,
+        lineSourceFinal,
+        nestedLineCount,
+        narrowListTried,
+        endpointErrors,
+        skipBuiltinLineApis
+      } = pack;
 
-      const sessionId = await fetchEcountSession();
-      const apiBase = await fetchEcountApiBase(comCode);
-      const basePayload = {
-        PROD_CD: "",
-        CUST_CD: "",
-        ListParam: {
-          BASE_DATE_FROM: range.fromCompact,
-          BASE_DATE_TO: range.toCompact,
-          PAGE_CURRENT: 1,
-          PAGE_SIZE: 100
-        }
-      };
-      const target = normalizeSlipNoText(slipNo);
-      const seq = target.split("-").pop() || "";
-      const endpointErrors = [];
-      const skipBuiltinLineApis = shouldSkipBuiltinLineApis();
-      let usedEndpoint = "GetPurchasesOrderList";
-      let rawRows = [];
-
-      const listUrl = `${apiBase}/OAPI/V2/Purchases/GetPurchasesOrderList?SESSION_ID=${encodeURIComponent(sessionId)}`;
-      const listResp = await fetch(listUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify(basePayload)
-      });
-      if (!listResp.ok) {
-        const txt = await listResp.text();
-        throw new Error(`발주 목록 조회 실패(${listResp.status}): ${txt.slice(0, 300)}`);
-      }
-      const listData = await listResp.json();
-      rawRows = extractArrayFromUnknown(listData);
-
-      const headerRaw = findMatchingRawOrderRow(rawRows, target, seq, range.toCompact);
-      const ordNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : "";
-      const ioNoRawEarly = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
-      let matched = [];
-      let lineSource = "header-flat";
-      let nestedLineCount = 0;
-      let narrowListTried = false;
-
-      if (headerRaw) {
-        const nestedLines = extractNestedLineRowsFromOrderRow(headerRaw);
-        nestedLineCount = nestedLines.length;
-        if (nestedLines.length) {
-          const merged = mergeOrderHeaderWithLines(headerRaw, nestedLines);
-          matched = normalizeInboundPlanRows(merged, range.toCompact);
-          lineSource = "nested-lines";
-        }
-      }
-
-      if (!matched.length && headerRaw) {
-        const narrowAttempts = [];
-        if (ordNoRawEarly) {
-          narrowAttempts.push({
-            label: "ListParam.ORD_NO",
-            body: { ...basePayload, ListParam: { ...basePayload.ListParam, ORD_NO: ordNoRawEarly } }
-          });
-          narrowAttempts.push({ label: "root.ORD_NO", body: { ...basePayload, ORD_NO: ordNoRawEarly } });
-        }
-        if (ioNoRawEarly) {
-          narrowAttempts.push({
-            label: "ListParam.IO_NO",
-            body: { ...basePayload, ListParam: { ...basePayload.ListParam, IO_NO: ioNoRawEarly } }
-          });
-        }
-        for (const na of narrowAttempts) {
-          narrowListTried = true;
-          try {
-            const nr = await fetch(listUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Accept: "application/json" },
-              body: JSON.stringify(na.body)
-            });
-            if (!nr.ok) continue;
-            const nd = await nr.json();
-            const nrows = extractArrayFromUnknown(nd);
-            const h2 = findMatchingRawOrderRow(nrows, target, seq, range.toCompact) || nrows[0];
-            if (!h2) continue;
-            const nl = extractNestedLineRowsFromOrderRow(h2);
-            if (nl.length) {
-              nestedLineCount = nl.length;
-              matched = normalizeInboundPlanRows(mergeOrderHeaderWithLines(h2, nl), range.toCompact);
-              lineSource = `narrow-list-${na.label}`;
-              break;
-            }
-          } catch (_) {
-            // ignore narrow failures
-          }
-        }
-      }
-
-      const envLinePaths = parseInboundLineApiPathSpecs(process.env.ECOUNT_INBOUND_LINE_API_PATHS || "");
-      if (!matched.length && envLinePaths.length) {
-        const ordNoL = ordNoRawEarly || seq;
-        const ioNoL = ioNoRawEarly;
-        const bodiesL = buildLineLookupBodies(basePayload, slipNo, ordNoL, ioNoL);
-        outerEnvLines: for (const v2Path of envLinePaths) {
-          for (const body of bodiesL.length ? bodiesL : [basePayload]) {
-            try {
-              const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, v2Path, body);
-              if (!ok) {
-                endpointErrors.push(`${v2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
-                continue;
-              }
-              const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
-              if (kind === "empty" || !filterLikelyItemLines(cand).length) {
-                endpointErrors.push(`${v2Path}:no-item-lines`);
-                continue;
-              }
-              matched = cand;
-              usedEndpoint = v2Path;
-              lineSource = `env-line-api-${kind}`;
-              break outerEnvLines;
-            } catch (err) {
-              endpointErrors.push(`${v2Path}:network ${err?.message || String(err)}`);
-            }
-          }
-        }
-      }
-
-      const customDetailApi = String(process.env.ECOUNT_INBOUND_DETAIL_API || "").trim();
-      if (!matched.length && customDetailApi) {
-        const ordNoRaw = ordNoRawEarly || seq;
-        const ioNoRaw = ioNoRawEarly;
-        const customV2Path = customDetailApi.includes("/") ? customDetailApi.replace(/^\/+/, "") : `Purchases/${customDetailApi}`;
-        const customBodies = buildLineLookupBodies(basePayload, slipNo, ordNoRaw, ioNoRaw);
-        outerCustom: for (const body of customBodies.length ? customBodies : [basePayload]) {
-          try {
-            const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, customV2Path, body);
-            if (!ok) {
-              endpointErrors.push(`${customV2Path}:(${status}) ${String(text || "").slice(0, 120)}`);
-              continue;
-            }
-            const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
-            if (kind === "empty" || !filterLikelyItemLines(cand).length) {
-              endpointErrors.push(`${customV2Path}:no-item-lines`);
-              continue;
-            }
-            matched = cand;
-            usedEndpoint = customV2Path;
-            lineSource = `custom-detail-api-${kind}`;
-            break outerCustom;
-          } catch (err) {
-            endpointErrors.push(`${customV2Path}:network ${err?.message || String(err)}`);
-          }
-        }
-      }
-
-      if (!matched.length && !skipBuiltinLineApis) {
-        const ordNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["ORD_NO"]) || "").trim() : seq;
-        const ioNoRaw = headerRaw ? String(pickFirstNonEmpty(headerRaw, ["IO_NO"]) || "").trim() : "";
-        const lineBodies = buildLineLookupBodies(basePayload, slipNo, ordNoRaw, ioNoRaw);
-        const purchaseMethods = [
-          "GetPurchases",
-          "GetPurchasesOrderDetail",
-          "GetPurchaseOrderDetail",
-          "GetPurchasesOrderInfo",
-          "GetPurchasesDetail"
-        ];
-        const extraModulePaths = [
-          "Purchases/GetReadPurchases",
-          "Purchases/ReadPurchases",
-          "Purchases/GetPurchasesList",
-          "Stock/GetPurchases",
-          "Inventory/GetPurchases",
-          "Inventory/GetPurchaseList"
-        ];
-        const detailAttempts = [];
-        for (const method of purchaseMethods) {
-          for (const body of lineBodies) {
-            detailAttempts.push({ path: `Purchases/${method}`, body });
-          }
-        }
-        for (const path of extraModulePaths) {
-          for (const body of lineBodies) {
-            detailAttempts.push({ path, body });
-          }
-        }
-
-        outerBuiltin: for (const c of detailAttempts) {
-          try {
-            const { ok, status, data, text } = await postEcountOapiV2(apiBase, sessionId, c.path, c.body);
-            if (!ok) {
-              endpointErrors.push(`${c.path}:(${status}) ${String(text || "").slice(0, 120)}`);
-              continue;
-            }
-            const { matched: cand, kind } = matchDetailRowsToInboundPlans(data, range.toCompact);
-            if (kind === "empty" || !filterLikelyItemLines(cand).length) {
-              endpointErrors.push(`${c.path}:no-item-lines`);
-              continue;
-            }
-            matched = cand;
-            usedEndpoint = c.path;
-            lineSource = `detail-api-${kind}`;
-            break outerBuiltin;
-          } catch (err) {
-            endpointErrors.push(`${c.path}:network ${err?.message || String(err)}`);
-          }
-        }
-      }
-
-      if (!matched.length) {
-        const items = normalizeInboundPlanRows(rawRows, range.toCompact);
-        matched = items.filter((x) => normalizeSlipNoText(x.poNo) === target);
-        if (!matched.length) {
-          matched = items.filter((x) => normalizeSlipNoText(x.poNo).endsWith(`-${seq}`));
-        }
-        lineSource = "list-summary-fallback";
-      }
-
-      const lineLike = matched.filter((x) => {
-        const hasCode = String(x.itemCode || "").trim() !== "";
-        const hasQty = String(x.qty || "").trim() !== "";
-        const isSummaryTitle = /외\s*\d+건/.test(String(x.itemName || ""));
-        return (hasCode || hasQty) && !isSummaryTitle;
-      });
-      if (lineLike.length) matched = lineLike;
-
-      const lineSourceFinal = lineSource;
       let hint = "";
       if (lineSourceFinal === "list-summary-fallback") {
         const parts = [
@@ -2202,10 +4472,22 @@ async function handleApi(req, res, urlObj) {
 
 ensureDb();
 
+/** /api 요청을 한 번에 하나만 처리해 db.json 동시 접근(Windows 잠금·덮어쓰기 유실)을 막음 */
+let dbApiQueue = Promise.resolve();
+
+function runSerializedApi(handler) {
+  const next = dbApiQueue.then(() => handler());
+  dbApiQueue = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
+}
+
 const server = http.createServer(async (req, res) => {
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
   if (urlObj.pathname.startsWith("/api/")) {
-    return handleApi(req, res, urlObj);
+    return runSerializedApi(() => handleApi(req, res, urlObj));
   }
   return serveStatic(req, res, urlObj.pathname);
 });
